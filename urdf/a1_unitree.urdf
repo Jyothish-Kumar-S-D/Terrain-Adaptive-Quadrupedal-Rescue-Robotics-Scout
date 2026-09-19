@@ -6,7 +6,7 @@
       <geometry>
         <box size="0.001 0.001 0.001" />
       </geometry>
-      
+
     </visual>
   </link>
   <joint name="floating_base" type="fixed">
@@ -20,8 +20,8 @@
       <geometry>
         <mesh filename="../meshes/trunk.dae" scale="1 1 1" />
       </geometry>
-      <material name = 'yellow'>
-        <color rgba="1.0 1.0 0.0 1.0"/>
+      <material name = 'white'>
+        <color rgba="1.0 1.0 1.0 1.0"/>
       </material>
     </visual>
     <collision>
@@ -52,8 +52,8 @@
       <geometry>
         <box size="0.001 0.001 0.001" />
       </geometry>
-      <material name="red">
-        <color rgba="0.8 0.0 0.0 1.0" />
+      <material name="cyan">
+        <color rgba="0.0 0.85 1.0 1.0" />
       </material>
     </visual>
     <collision>
@@ -77,8 +77,8 @@
       <geometry>
         <mesh filename="../meshes/hip.dae" scale="1 1 1" />
       </geometry>
-      <material name="carbon_black">
-        <color rgba="0.1 0.1 0.1 1.0" />
+      <material name="graphite_black">
+        <color rgba="0.06 0.07 0.09 1.0" />
       </material>
     </visual>
     <collision>
@@ -120,8 +120,8 @@
       <geometry>
         <mesh filename="../meshes/thigh_mirror.dae" scale="1 1 1" />
       </geometry>
-      <material name="orange">
-        <color rgba="1.0 0.423529411765 0.0392156862745 1.0" />
+      <material name="titanium_black">
+        <color rgba="0.32 0.35 0.39 1.0" />
       </material>
     </visual>
     <collision>
@@ -150,8 +150,8 @@
       <geometry>
         <mesh filename="../meshes/calf.dae" scale="1 1 1" />
       </geometry>
-      <material name="orange">
-        <color rgba="1.0 0.423529411765 0.0392156862745 1.0" />
+      <material name="dark_graphite">
+        <color rgba="0.12 0.14 0.17 1.0" />
       </material>
     </visual>
     <collision>
@@ -177,8 +177,8 @@
       <geometry>
         <sphere radius="0.01" />
       </geometry>
-      <material name="orange">
-        <color rgba="1.0 0.423529411765 0.0392156862745 1.0" />
+      <material name="black">
+        <color rgba="0.0 0.0 0.0 1.0" />
       </material>
     </visual>
     <collision>
@@ -249,8 +249,8 @@
       <geometry>
         <mesh filename="../meshes/thigh.dae" scale="1 1 1" />
       </geometry>
-      <material name="orange">
-        <color rgba="1.0 0.423529411765 0.0392156862745 1.0" />
+      <material name="titanium_gray">
+        <color rgba="0.32 0.35 0.39 1.0" />
       </material>
     </visual>
     <collision>
@@ -279,8 +279,8 @@
       <geometry>
         <mesh filename="../meshes/calf.dae" scale="1 1 1" />
       </geometry>
-      <material name="orange">
-        <color rgba="1.0 0.423529411765 0.0392156862745 1.0" />
+      <material name="dark_graphite">
+        <color rgba="0.12 0.14 0.17 1.0" />
       </material>
     </visual>
     <collision>
@@ -306,8 +306,8 @@
       <geometry>
         <sphere radius="0.01" />
       </geometry>
-      <material name="orange">
-        <color rgba="1.0 0.423529411765 0.0392156862745 1.0" />
+      <material name="black">
+        <color rgba="0.0 0.0 0.0 1.0" />
       </material>
     </visual>
     <collision>
@@ -378,8 +378,8 @@
       <geometry>
         <mesh filename="../meshes/thigh_mirror.dae" scale="1 1 1" />
       </geometry>
-      <material name="orange">
-        <color rgba="1.0 0.423529411765 0.0392156862745 1.0" />
+      <material name="titanium_gray">
+        <color rgba="0.32 0.35 0.39 1.0" />
       </material>
     </visual>
     <collision>
@@ -408,8 +408,8 @@
       <geometry>
         <mesh filename="../meshes/calf.dae" scale="1 1 1" />
       </geometry>
-      <material name="orange">
-        <color rgba="1.0 0.423529411765 0.0392156862745 1.0" />
+      <material name="dark_graphite">
+        <color rgba="0.12 0.14 0.17 1.0" />
       </material>
     </visual>
     <collision>
@@ -435,8 +435,8 @@
       <geometry>
         <sphere radius="0.01" />
       </geometry>
-      <material name="orange">
-        <color rgba="1.0 0.423529411765 0.0392156862745 1.0" />
+      <material name="black">
+        <color rgba="0.0 0.0 0.0 1.0" />
       </material>
     </visual>
     <collision>
@@ -507,8 +507,8 @@
       <geometry>
         <mesh filename="../meshes/thigh.dae" scale="1 1 1" />
       </geometry>
-      <material name="orange">
-        <color rgba="1.0 0.423529411765 0.0392156862745 1.0" />
+      <material name="titanium_gray">
+        <color rgba="0.32 0.35 0.39 1.0" />
       </material>
     </visual>
     <collision>
@@ -537,8 +537,8 @@
       <geometry>
         <mesh filename="../meshes/calf.dae" scale="1 1 1" />
       </geometry>
-      <material name="orange">
-        <color rgba="1.0 0.423529411765 0.0392156862745 1.0" />
+      <material name="dark_graphite">
+        <color rgba="0.12 0.14 0.17 1.0" />
       </material>
     </visual>
     <collision>
@@ -564,8 +564,8 @@
       <geometry>
         <sphere radius="0.01" />
       </geometry>
-      <material name="orange">
-        <color rgba="1.0 0.423529411765 0.0392156862745 1.0" />
+      <material name="black">
+        <color rgba="0.0 0.0 0.0 1.0" />
       </material>
     </visual>
     <collision>
@@ -580,3 +580,4 @@
     </inertial>
   </link>
 </robot>
+
