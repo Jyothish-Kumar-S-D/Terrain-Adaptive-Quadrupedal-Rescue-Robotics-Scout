@@ -28,6 +28,11 @@ import time
 import pybullet as p
 import pybullet_data
 
+#Import modules from files
+from get_depth_map import DepthCamera
+#files import ends
+
+
 # ----------------------------------------------------------------------
 # Constants derived from the supplied joint dump
 # ----------------------------------------------------------------------
@@ -229,6 +234,7 @@ p.setTimeStep(1.0 / 240.0)
 plane_id = p.loadURDF("plane.urdf")
 start_z = abs(Z_DOWN) + 0.02
 robot_id = p.loadURDF(URDF_PATH, [0, 0, start_z], useFixedBase=False)
+camera=DepthCamera(robot_id) #depth map stuff does here
 
 joint_name_to_index = {}
 for j in range(p.getNumJoints(robot_id)):
@@ -331,6 +337,10 @@ try:
                 )
 
         p.stepSimulation()
+        #depth camera code
+        depth=camera.capture()
+        camera.show(depth)
+        #depth camera code ends
 
         if t - _last_gyro_print > GYRO_PRINT_INTERVAL:
             roll_rate, pitch_rate, yaw_rate = read_gyro(robot_id, imu_link_index)
