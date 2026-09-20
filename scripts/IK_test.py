@@ -28,8 +28,16 @@ import time
 import pybullet as p
 import pybullet_data
 
+import sys
+from pathlib import Path
+
+# Navigates up two levels (from script.py -> scripts/ -> project/) and adds it to Python's search path
+root_dir = str(Path(__file__).resolve().parent.parent)
+if root_dir not in sys.path:
+    sys.path.append(root_dir)
+
 #Import modules from files
-from get_depth_map import DepthCamera
+from depth_processing.Depth_Processing import DepthCamera
 #files import ends
 
 
@@ -296,8 +304,8 @@ STANCE_Z = -0.22          # nominal standing height below hip (< MAX_REACH)
 STEP_LEN = 0.05        # fore-aft stride length (kept modest: crawl gait
                            # has 3 legs bearing load while one swings, so a
                            # smaller step reduces tip-over risk than a trot)
-STEP_HEIGHT = 0.03     # swing foot clearance
-CYCLE_TIME = 3.0    # seconds per full gait cycle (slower than a trot,
+STEP_HEIGHT = 0.05    # swing foot clearance
+CYCLE_TIME = 2.0    # seconds per full gait cycle (slower than a trot,
                            # since each leg's window is a quarter-cycle)
 
 assert abs(STANCE_Z) < MAX_REACH, "STANCE_Z exceeds leg reach"
