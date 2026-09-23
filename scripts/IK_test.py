@@ -38,6 +38,7 @@ if root_dir not in sys.path:
 
 #Import modules from files
 from depth_processing.Depth_Processing import DepthCamera
+from surrounding_building.terrain_building import create_pyramid, create_surroundings
 #files import ends
 
 
@@ -240,6 +241,10 @@ p.setGravity(0, 0, -9.81)
 p.setTimeStep(1.0 / 240.0)
 
 plane_id = p.loadURDF("plane.urdf")
+terrain_ids = create_surroundings()
+
+
+
 start_z = abs(Z_DOWN) + 0.02
 robot_id = p.loadURDF(URDF_PATH, [0, 0, start_z], useFixedBase=False)
 camera=DepthCamera(robot_id) #depth map stuff does here
