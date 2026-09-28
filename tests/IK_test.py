@@ -69,8 +69,8 @@ LEGS = {
 # each offset by one quarter of the cycle. Only ONE leg is in its swing
 # window [0, SWING_FRAC) of its own local phase at any instant; the other
 # three are always in stance.
-PHASE_OFFSET = {"RL": 0.0, "FL": 0.25, "RR": 0.5, "FR": 0.75}
-SWING_FRAC = 0.05# duty factor: 0.75 stance / 0.25 swing per leg
+PHASE_OFFSET = {"RL": 0.0, "FL": 0.75, "RR": 0.5, "FR": 0.25}
+SWING_FRAC = 0.15# duty factor: 0.75 stance / 0.25 swing per leg
 
 # +1 = stance sweeps foot front-to-back (pushes body toward +x / forward).
 # If the robot still walks backward with this gait, flip this to -1 —
@@ -301,11 +301,11 @@ MAX_FORCE = 33.5  # from joint dump
 # ----------------------------------------------------------------------
 
 STANCE_Z = -0.22          # nominal standing height below hip (< MAX_REACH)
-STEP_LEN = 0.05        # fore-aft stride length (kept modest: crawl gait
+STEP_LEN = 0.08       # fore-aft stride length (kept modest: crawl gait
                            # has 3 legs bearing load while one swings, so a
                            # smaller step reduces tip-over risk than a trot)
-STEP_HEIGHT = 0.05    # swing foot clearance
-CYCLE_TIME = 2.0    # seconds per full gait cycle (slower than a trot,
+STEP_HEIGHT = 0.10  # swing foot clearance
+CYCLE_TIME = 1.0    # seconds per full gait cycle (slower than a trot,
                            # since each leg's window is a quarter-cycle)
 
 assert abs(STANCE_Z) < MAX_REACH, "STANCE_Z exceeds leg reach"
@@ -345,10 +345,10 @@ try:
                 )
 
         p.stepSimulation()
-        #depth camera code
-        depth=camera.capture()
-        camera.show(depth)
-        #depth camera code ends
+        # #depth camera code
+        # depth=camera.capture()
+        # camera.show(depth)
+        # #depth camera code ends
 
         if t - _last_gyro_print > GYRO_PRINT_INTERVAL:
             roll_rate, pitch_rate, yaw_rate = read_gyro(robot_id, imu_link_index)
