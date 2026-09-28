@@ -66,11 +66,20 @@ class DepthCamera:
         ).reshape(3, 3)
 
         # Camera looks along local +X
-        forward = rotation @ np.array([1.0, 0.0, 0.0])
+        forward = rotation @ np.array([
+            1.0,
+            0.0,
+            0.0
+        ])
 
         # Camera up direction
-        up = rotation @ np.array([0.0, 0.0, 1.0])
+        up = rotation @ np.array([
+            0.0,
+            0.0,
+            1.0
+        ])
 
+        # Look forward from the camera
         target = camera_pos + forward
 
         return p.computeViewMatrix(
@@ -93,13 +102,19 @@ class DepthCamera:
         depth_buffer = np.asarray(
             image[3],
             dtype=np.float32,
-        ).reshape(self.height, self.width)
+        ).reshape(
+            self.height,
+            self.width
+        )
 
+        # Convert depth buffer to metric depth
         depth = (
             self.near * self.far
             / (
                 self.far
-                - depth_buffer * (self.far - self.near)
+                - depth_buffer * (
+                    self.far - self.near
+                )
             )
         )
 
@@ -118,8 +133,13 @@ class DepthCamera:
             / (self.far - self.near)
         ).astype(np.uint8)
 
-        cv2.imshow("Depth Camera", display)
+        cv2.imshow(
+            "Depth Camera",
+            display
+        )
+
         cv2.waitKey(1)
 
     def close(self):
         cv2.destroyAllWindows()
+        
