@@ -29,11 +29,12 @@ from pathlib import Path
 
 import numpy as np
 
-# Navigates up two levels (from script.py -> tests/ -> project/) and
-# adds it to Python's search path
 root_dir = str(Path(__file__).resolve().parent.parent)
 if root_dir not in sys.path:
     sys.path.append(root_dir)
+tests_dir = str(Path(__file__).resolve().parent)
+if tests_dir not in sys.path:
+    sys.path.append(tests_dir)
 
 import pybullet as p
 import pybullet_data
@@ -199,6 +200,11 @@ def main():
         print(f"circle fit: radius={r:.3f} m (commanded {abs(args.radius):.3f}), "
               f"centre=({cx:+.3f}, {cy:+.3f}) m in start frame "
               f"(commanded (0, {args.radius:+.3f}))")
+    if gui:
+        try:
+            input("\n[PyBullet GUI] Simulation finished. Press [Enter] in this terminal to close the window...")
+        except (KeyboardInterrupt, EOFError):
+            pass
     p.disconnect()
 
 
