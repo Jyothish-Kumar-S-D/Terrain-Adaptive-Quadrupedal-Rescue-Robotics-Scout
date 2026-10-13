@@ -109,15 +109,18 @@ class LegStep:
     length_x: float = 0.08  # fore-aft stride (+ forward)
     length_y: float = 0.0   # lateral stride (+ left)
     height: float = 0.10    # swing clearance
+    stance_z: Optional[float] = None  # optional per-leg stance depth
+    offset_y: float = 0.0   # lateral foot stance offset (+ left, - right)
 
 
 @dataclass
 class CycleCommand:
     legs: Dict[str, LegStep]
     cycle_time: float = 1.0
-    stance_z: float = -0.22
+    stance_z: float = -0.21
     swing_frac: float = 0.15
-    cg_offset_x: float = -0.085
+    cg_offset_x: float = -0.065
+    stance_width: float = 0.0
     phase_offset: Dict[str, float] = field(
         default_factory=lambda: dict(DEFAULT_PHASE_OFFSET)
     )
@@ -144,15 +147,24 @@ class CycleCommand:
         return cls(legs={n: step for n in LEG_NAMES}, **kw)
 
     @classmethod
-    def differential(cls, length_x=0.08, turn=0.0, height=0.10,
-                     length_y=0.0, **kw):
-        """Skid-steer style turn. turn in [-1, 1]; > 0 turns left
-        (right legs stride longer, left legs shorter)."""
+    def differential(cls, length_x=0.06, turn=0.0, height=0.12,
+                     length_y=0.0, leg_z=None, stance_width=0.02, **kw):
+        """Skid-steer style turn with bounded outer stride and inner leg deceleration.
+        
+        Guarantees outer legs NEVER over-stride beyond length_x into kinematic singularity,
+        while inner legs decelerate proportionally to execute the turn cleanly.
+        """
         legs = {}
+        turn = max(-1.0, min(1.0, float(turn)))
         for n in LEG_NAMES:
-            scale = 1.0 + turn if SIDE[n] < 0 else 1.0 - turn
-            legs[n] = LegStep(length_x * scale, length_y, height)
-        return cls(legs=legs, **kw)
+            # For turn > 0 (CCW/left): right legs (SIDE < 0) are outer, left legs (SIDE > 0) are inner
+            # For turn < 0 (CW/right): left legs (SIDE > 0) are outer, right legs (SIDE < 0) are inner
+            is_outer = (turn >= 0 and SIDE[n] < 0) or (turn < 0 and SIDE[n] > 0)
+            scale = 1.0 if is_outer else max(0.15, 1.0 - abs(turn))
+            z_n = leg_z.get(n) if leg_z is not None else None
+            y_off = SIDE[n] * stance_width
+            legs[n] = LegStep(length_x * scale, length_y, height, stance_z=z_n, offset_y=y_off)
+        return cls(legs=legs, stance_width=stance_width, **kw)
 
     def with_leg(self, leg: str, **step_kw) -> "CycleCommand":
         """Copy of this command with one leg's LegStep fields changed."""
@@ -165,12 +177,13 @@ class CycleCommand:
 # Gait generator
 # ----------------------------------------------------------------------
 class _LegState:
-    __slots__ = ("step", "z", "cg", "in_swing", "pos", "swing_from")
+    __slots__ = ("step", "z", "cg", "in_swing", "pos", "swing_from", "offset_y")
 
     def __init__(self):
         self.step = LegStep()
         self.z = -0.22
         self.cg = 0.0
+        self.offset_y = 0.0
         self.in_swing = False
         self.pos: Vec3 = (0.0, 0.0, -0.22)
         self.swing_from: Vec3 = self.pos
@@ -225,7 +238,9 @@ class CrawlGait:
     def swinging(self):
         return [n for n, st in self.legs.items() if st.in_swing]
 
-    def update(self, dt: float) -> Dict[str, Tuple[float, float, float]]:
+    def update(self, dt: float,
+               actual_foot_pos: Optional[Dict[str, Vec3]] = None
+               ) -> Dict[str, Tuple[float, float, float]]:
         self.t += dt
         self.cycle_phase += dt / self.cmd.cycle_time
         while self.cycle_phase >= 1.0:
@@ -243,7 +258,13 @@ class CrawlGait:
                 if not st.in_swing:
                     self._latch(n, st, cmd)
                     st.in_swing = True
-                    st.swing_from = st.pos
+                    # Obstacle-aware swing start: if foot is resting on an elevated obstacle,
+                    # lift off from actual contact height rather than jumping down into the obstacle.
+                    if actual_foot_pos is not None and n in actual_foot_pos:
+                        af = actual_foot_pos[n]
+                        st.swing_from = (af[0], af[1], max(st.pos[2], af[2]))
+                    else:
+                        st.swing_from = st.pos
                 st.pos = self._swing_pos(st, lp / cmd.swing_frac)
             else:
                 st.in_swing = False
@@ -268,8 +289,9 @@ class CrawlGait:
     @staticmethod
     def _latch(leg, st: _LegState, cmd: CycleCommand):
         st.step = cmd.legs[leg]
-        st.z = cmd.stance_z
+        st.z = cmd.legs[leg].stance_z if cmd.legs[leg].stance_z is not None else cmd.stance_z
         st.cg = cmd.cg_offset_x
+        st.offset_y = cmd.legs[leg].offset_y if cmd.legs[leg].offset_y != 0.0 else (SIDE[leg] * cmd.stance_width)
 
     @staticmethod
     def _stance_s(lp, cmd):
@@ -281,7 +303,7 @@ class CrawlGait:
         # is what pushes the body in the commanded direction
         s = max(0.0, min(1.0, s))
         k = 0.5 - s
-        return (st.cg + st.step.length_x * k, st.step.length_y * k, st.z)
+        return (st.cg + st.step.length_x * k, st.offset_y + st.step.length_y * k, st.z)
 
     @staticmethod
     def _swing_pos(st: _LegState, s: float) -> Vec3:
@@ -289,12 +311,15 @@ class CrawlGait:
         e = 0.5 * (1.0 - math.cos(math.pi * s))  # zero velocity at both ends
         fx, fy, fz = st.swing_from
         tx = st.cg + 0.5 * st.step.length_x
-        ty = 0.5 * st.step.length_y
+        ty = st.offset_y + 0.5 * st.step.length_y
         tz = st.z
+        # High-stepping clearance trajectory for pyramids:
+        # Rapid liftoff (power 0.40) ensures >60% clearance at s=0.10 to clear 8cm pyramid ridges
+        clearance = math.sin(math.pi * s) ** 0.40 if 0.0 < s < 1.0 else 0.0
         return (
             fx + (tx - fx) * e,
             fy + (ty - fy) * e,
-            fz + (tz - fz) * e + st.step.height * math.sin(math.pi * s),
+            fz + (tz - fz) * e + st.step.height * clearance,
         )
 
 
