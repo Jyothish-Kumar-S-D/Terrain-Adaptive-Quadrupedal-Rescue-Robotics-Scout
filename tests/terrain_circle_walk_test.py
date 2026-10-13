@@ -39,8 +39,9 @@ import pybullet as p
 import pybullet_data
 
 from surrounding_building.terrain_building import (
-    RandomTerrainConfig, create_random_terrain, terrain_layout,
+    RandomTerrainConfig, terrain_layout,
 )
+from path_training import PathTaskConfig, PathTrainingTask
 
 # same-folder test modules
 from circle_wlk_test import circle_command, fit_circle
@@ -69,9 +70,9 @@ def main():
     g = ap.add_argument_group("random terrain")
     g.add_argument("--seed", type=int, default=7,
                    help="RNG seed; same seed -> same terrain")
-    g.add_argument("--extent", type=float, default=3.0,
+    g.add_argument("--extent", type=float, default=6.7,
                    help="side length [m] of the square terrain patch")
-    g.add_argument("--spacing", type=float, default=0.26,
+    g.add_argument("--spacing", type=float, default=0.24,
                    help="grid pitch [m]; <= pyramid size packs tightly")
     g.add_argument("--size-min", dest="size_min", type=float, default=0.16,
                    help="min pyramid base side [m]")
@@ -81,7 +82,7 @@ def main():
                    help="min pyramid height [m]")
     g.add_argument("--height-max", dest="height_max", type=float, default=0.08,
                    help="max pyramid height [m]")
-    g.add_argument("--density", type=float, default=0.95,
+    g.add_argument("--density", type=float, default=1.0,
                    help="fraction of grid cells that get a pyramid")
     g.add_argument("--jitter", type=float, default=0.05,
                    help="max random offset of a pyramid centre [m]")
@@ -103,6 +104,9 @@ def main():
         height=(args.height_min, args.height_max),
         density=args.density, jitter=args.jitter,
         clear_radius=args.clear_radius, base_z=args.base_z,
+    )
+    task = PathTrainingTask(
+        PathTaskConfig(terrain=cfg), seed=args.seed,
     )
 
     # terrain stats, computed from the layout without touching the sim
@@ -130,8 +134,9 @@ def main():
 
     # collision plane first, rugged pyramids on top of it
     p.loadURDF("plane.urdf")
-    terrain_ids = create_random_terrain(cfg)
-    print(f"loaded {len(terrain_ids)} collidable pyramids into the env")
+    episode_path = task.reset_episode(load_terrain=True)
+    print(f"episode {task.episode_index}: loaded {len(task.terrain_ids)} collidable "
+          f"pyramids; generated {len(episode_path.points)}-sample smooth path")
 
     robot = p.loadURDF(args.urdf, [0, 0, abs(Z_DOWN) + 0.02], useFixedBase=False)
     joints = leg_joint_map(robot)
@@ -170,10 +175,14 @@ def main():
             if gait.t >= next_print:
                 next_print += 2.0
                 pos = p.getBasePositionAndOrientation(robot)[0]
+                observation = task.observe(robot)
+                reward = task.reward(observation, terminated=pos[2] < 0.12)
                 x, y = to_start_frame(pos)
                 yaw = math.degrees(yaw_of(robot) - yaw0)
                 print(f"  t={gait.t:5.1f}s  x={x:+.3f} y={y:+.3f} z={pos[2]:.3f}  "
-                      f"yaw={yaw:+7.1f} deg (expected {math.degrees(omega * gait.t):+7.1f})")
+                      f"yaw={yaw:+7.1f} deg (expected {math.degrees(omega * gait.t):+7.1f}) "
+                      f"path-offset={float(observation['path_offset']):+.3f} m "
+                      f"reward={reward['total']:.3f}")
                 if pos[2] < 0.12:
                     print("  !! base very low / fallen, stopping")
                     fallen = True
