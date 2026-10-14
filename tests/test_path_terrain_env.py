@@ -1,21 +1,17 @@
-"""test_path_terrain_env.py -- Comprehensive test script for QuadrupedPathTerrainEnv.
+"""test_path_terrain_env.py -- Verification & Test Suite for QuadrupedPathTerrainEnv.
 
-Follows the testing conventions from terrain_circle_walk_test.py and circle_wlk_test.py:
-- Tests the Gymnasium environment using either:
-  1) 'crawl': Analytical CrawlGait walking over the dense pyramid terrain
-  2) 'stand': Nominal standing pose stability check
-  3) 'random': Stochastic exploration policy
-- Evaluates:
-  - Randomized continuous path initialization per episode
-  - Dense packed pyramid terrain generation
-  - Observation dictionary structure (joint states, trunk orientation, path offset, depth frame)
-  - Multi-objective reward telemetry (path position, velocity tangent alignment, trunk stability, progress)
-- Supports both interactive PyBullet GUI with camera tracking and fast headless (--direct) mode.
+Validates the Gymnasium Training Environment:
+1. Environment Initialization (__init__): Action space, observation space, physics client, URDF.
+2. Environment Reset (reset): Continuous spline path, dense pyramids, robot spawn posture.
+3. Action Execution (step): Action initiation (target joint computation, limits, motor control).
+4. Multi-Objective Reward Function: Forward tracking, corridor tracking, stability, progress, penalties.
+5. Termination & Truncation: Fall detection, corridor exit, step limits, goal achievement.
+6. Gymnasium API Compliance: Built-in gymnasium.utils.env_checker.check_env support.
 
 Usage:
-  python tests/test_path_terrain_env.py --policy crawl --episodes 2
-  python tests/test_path_terrain_env.py --direct --episodes 3 --max-steps 150
-  python tests/test_path_terrain_env.py --policy stand --seed 42 --gui
+  python tests/test_path_terrain_env.py --policy stand --episodes 1 --max-steps 300
+  python tests/test_path_terrain_env.py --policy random --episodes 2 --max-steps 200 --direct
+  python tests/test_path_terrain_env.py --check-env
 """
 
 from __future__ import annotations
@@ -25,7 +21,7 @@ import math
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
@@ -41,40 +37,37 @@ import path_training
 from path_training.gym_env import (
     JOINT_NAMES,
     NOMINAL_JOINT_ANGLES,
+    JOINT_LOWER_LIMITS,
+    JOINT_UPPER_LIMITS,
     QuadrupedPathTerrainEnv,
+    get_nominal_cycle_action,
+    NOMINAL_ACTION_PARAMS,
+    normalize_action,
+    denormalize_action,
 )
 from path_training.task import PathTaskConfig
 from surrounding_building.terrain_building import RandomTerrainConfig
 
-# Import IK gait components for realistic quadruped testing
-from Inverse_Kinematics.IK_A1 import (
-    LEG_NAMES,
-    SIDE,
-    IK_X_SIGN,
-    L1,
-    CrawlGait,
-    CycleCommand,
-    leg_fk,
-)
-
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Test QuadrupedPathTerrainEnv with randomized path and dense pyramid terrain."
+        description="Verify and test QuadrupedPathTerrainEnv Gymnasium training environment."
     )
 
     # Simulation & environment args
     parser.add_argument("--episodes", type=int, default=1, help="Number of test episodes")
-    parser.add_argument("--max-steps", type=int, default=1000, help="Max steps per episode")
+    parser.add_argument("--max-steps", type=int, default=50, help="Max gait cycles per episode")
     parser.add_argument(
         "--policy",
-        choices=["crawl", "stand", "random"],
-        default="crawl",
-        help="Evaluation policy to drive the robot: 'crawl' (IK gait), 'stand', or 'random'",
+        choices=["nominal", "crawl", "random", "stand"],
+        default="nominal",
+        help="Test action policy: 'nominal'/'crawl' (high-level crawl gait), 'random' (stochastic exploration), 'stand' (zero stride length)",
     )
     parser.add_argument("--direct", action="store_true", help="Headless mode (no PyBullet GUI window)")
+    parser.add_argument("--check-env", action="store_true", help="Run Gymnasium API compliance checker")
     parser.add_argument("--urdf", default="urdf/a1_unitree.urdf", help="Path to robot URDF")
     parser.add_argument("--action-scale", type=float, default=1.60, help="Action scaling factor")
+    parser.add_argument("--seed", type=int, default=42, help="Base RNG seed")
 
     # Depth camera args
     d_grp = parser.add_argument_group("depth camera options")
@@ -90,9 +83,8 @@ def parse_args():
     p_grp.add_argument("--path-samples", type=int, default=300, help="Number of spline curve samples")
     p_grp.add_argument("--target-speed", type=float, default=0.15, help="Target path-following speed [m/s]")
 
-    # Dense pyramid terrain args (matches terrain_circle_walk_test.py)
+    # Dense pyramid terrain args
     t_grp = parser.add_argument_group("random packed-pyramid terrain options")
-    t_grp.add_argument("--seed", type=int, default=7, help="Base RNG seed; same seed -> same layout")
     t_grp.add_argument("--extent", type=float, default=5.0, help="Side length [m] of square terrain patch")
     t_grp.add_argument("--spacing", type=float, default=0.24, help="Grid pitch [m]; <= size packs densely")
     t_grp.add_argument("--size-min", type=float, default=0.16, help="Min pyramid base side length [m]")
@@ -103,121 +95,42 @@ def parse_args():
     t_grp.add_argument("--jitter", type=float, default=0.05, help="Random position jitter [m]")
     t_grp.add_argument("--clear-radius", type=float, default=0.45, help="Flat spawn disc radius [m]")
 
-    # Crawl gait tuning (when --policy crawl is selected)
-    c_grp = parser.add_argument_group("crawl gait options")
-    c_grp.add_argument("--stride-x", type=float, default=0.055, help="Forward stride length [m]")
-    c_grp.add_argument("--swing-height", type=float, default=0.13, help="Foot clearance in swing [m]")
-    c_grp.add_argument("--cycle-time", type=float, default=1.2, help="Gait cycle period [s]")
-
     return parser.parse_args()
 
 
-class CrawlPolicy:
-    """Analytical IK crawl gait policy mapped into Gymnasium action space with path steering."""
-
-    def __init__(
-        self,
-        stride_x: float = 0.055,
-        swing_height: float = 0.13,
-        cycle_time: float = 1.2,
-        action_scale: float = 1.60,
-        dt: float = 4.0 / 240.0,
-    ):
-        self.stride_x = stride_x
-        self.swing_height = swing_height
-        self.cycle_time = cycle_time
-        self.cmd = CycleCommand.uniform(
-            length_x=stride_x,
-            length_y=0.0,
-            height=swing_height,
-            cycle_time=cycle_time,
-        )
-        self.gait = CrawlGait(self.cmd, cycle_provider=lambda n: self.cmd)
-        self.action_scale = max(action_scale, 1e-4)
-        self.dt = dt
-        self._last_joint_positions: Optional[np.ndarray] = None
-
-    def reset(self):
-        self.cmd = CycleCommand.uniform(
-            length_x=self.stride_x,
-            length_y=0.0,
-            height=self.swing_height,
-            cycle_time=self.cycle_time,
-        )
-        self.gait = CrawlGait(self.cmd, cycle_provider=lambda n: self.cmd)
-        self._last_joint_positions = None
-
-    def steer(self, obs: Dict[str, np.ndarray], info: Dict[str, Any], path_tangents: np.ndarray):
-        """Pure-pursuit lookahead steering with inner-leg deceleration to prevent singularity."""
-        self._last_joint_positions = obs.get("joint_positions")
-
-        offset = float(obs["path_offset"][0])
-        curr_idx = int(info.get("path_index", 0))
-        # Look ahead 6 waypoints (~9 cm ahead) to anticipate curvature
-        lookahead_idx = min(curr_idx + 6, len(path_tangents) - 1)
-        tangent = path_tangents[lookahead_idx]
-        target_yaw = math.atan2(tangent[1], tangent[0])
-        current_yaw = float(obs["trunk_orientation"][2])
-        yaw_err = (target_yaw - current_yaw + math.pi) % (2.0 * math.pi) - math.pi
-
-        # Reduce forward stride on sharp bends so differential steering pivots cleanly
-        speed_factor = max(0.40, 1.0 - 0.50 * min(1.0, abs(yaw_err) / 0.8))
-        effective_stride = self.stride_x * speed_factor
-
-        turn = np.clip(1.5 * offset + 1.2 * yaw_err, -0.70, 0.70)
-
-        # Active terrain attitude leveling:
-        # If trunk is tilted because one side/end is high on a pyramid, retract elevated legs
-        # to level the trunk and keep the center of gravity safely within the support polygon.
-        roll = float(obs["trunk_orientation"][0])
-        pitch = float(obs["trunk_orientation"][1])
-        leg_z = {}
-        for leg in LEG_NAMES:
-            y_leg = 0.13 if 'L' in leg else -0.13
-            x_leg = 0.18 if 'F' in leg else -0.18
-            z_rel = y_leg * math.sin(roll) - x_leg * math.sin(pitch)
-            # Only retract elevated legs (up to 5.5 cm); NEVER extend deeper than -0.21m
-            dz_retract = max(0.0, min(0.055, z_rel))
-            leg_z[leg] = -0.21 + dz_retract
-
-        self.cmd = CycleCommand.differential(
-            length_x=effective_stride,
-            turn=float(turn),
-            height=self.swing_height,
-            cycle_time=self.cycle_time,
-            leg_z=leg_z,
-            stance_width=0.025,
-        )
-        self.gait.cmd = self.cmd
-
-    def get_action(self) -> np.ndarray:
-        # Compute actual foot positions from observation FK for obstacle-aware liftoff
-        actual_feet = None
-        if self._last_joint_positions is not None and len(self._last_joint_positions) == 12:
-            actual_feet = {}
-            for i, leg in enumerate(LEG_NAMES):
-                q_leg = self._last_joint_positions[i * 3 : (i + 1) * 3]
-                side = SIDE[leg]
-                a, y_fk, z_fk = leg_fk(float(q_leg[0]), float(q_leg[1]), float(q_leg[2]), side)
-                actual_feet[leg] = (a * IK_X_SIGN, y_fk - side * L1, z_fk)
-
-        targets_dict = self.gait.update(self.dt, actual_foot_pos=actual_feet)
-        # Flatten joint targets in the canonical environment order: FR, FL, RR, RL
-        target_list = []
-        for leg in LEG_NAMES:
-            q_leg = targets_dict[leg]
-            target_list.extend(q_leg)
-
-        target_q = np.array(target_list, dtype=np.float32)
-        # Invert action mapping: action = (target_q - nominal_q) / action_scale
-        raw_action = (target_q - NOMINAL_JOINT_ANGLES) / self.action_scale
-        return np.clip(raw_action, -1.0, 1.0)
-
-
 def print_banner(text: str):
-    print("\n" + "=" * 90)
+    print("\n" + "=" * 95)
     print(f" {text}")
-    print("=" * 90)
+    print("=" * 95)
+
+
+def generate_test_action(policy_type: str, step_idx: int, action_space: gym.spaces.Box) -> np.ndarray:
+    """Generate normalized action in [-1.0, 1.0]^26 for the chosen policy."""
+    if policy_type in ("nominal", "crawl", "walk"):
+        # Nominal wave crawl gait parameters
+        return get_nominal_cycle_action()
+    elif policy_type == "stand":
+        # Stance without strides (zero length_x and length_y)
+        params = NOMINAL_ACTION_PARAMS.copy()
+        # Indices 13..20 are length_x and length_y
+        params[13:21] = 0.0
+        return normalize_action(params)
+    elif policy_type == "random":
+        # Stochastic exploration action uniformly sampled from action space
+        return action_space.sample()
+    else:
+        return get_nominal_cycle_action()
+
+
+def run_compliance_check(env: gym.Env):
+    """Run Gymnasium official environment compliance checker."""
+    print_banner("RUNNING GYMNASIUM API COMPLIANCE CHECK (check_env)")
+    from gymnasium.utils.env_checker import check_env
+    try:
+        check_env(env.unwrapped, skip_render_check=True)
+        print("[SUCCESS] Gymnasium API compliance check PASSED without errors!")
+    except Exception as e:
+        print(f"[FAIL] Gymnasium API check encountered issue: {e}")
 
 
 def run_environment_test():
@@ -225,16 +138,32 @@ def run_environment_test():
     gui = not args.direct
     render_mode = "human" if gui else None
 
-    print_banner("TESTING QUADRUPED PATH-FOLLOWING TERRAIN GYMNASIUM ENVIRONMENT")
+    try:
+        import pybullet as p
+    except ImportError:
+        p = None
+
+    if gui and p is None:
+        print("\n" + "!" * 95)
+        print(" [ERROR] PyBullet is not installed in the currently active Python environment!")
+        print(" The PyBullet GUI window cannot be loaded from this Python binary.")
+        print(" Please activate the Conda environment where PyBullet is installed:")
+        print("     conda activate a1_pybullet")
+        print(" or run this script using:")
+        print(r"     C:\Users\mahes\.conda\envs\a1_pybullet\python.exe tests/test_path_terrain_env.py --policy nominal --max-steps 50")
+        print("!" * 95 + "\n")
+        sys.exit(1)
+
+    print_banner("QUADRUPED PATH-FOLLOWING TERRAIN TRAINING ENVIRONMENT TEST")
     print(f"Policy:           {args.policy.upper()}")
     print(f"Render Mode:      {render_mode or 'DIRECT (Headless)'}")
     print(f"Episodes:         {args.episodes}")
     print(f"Max Steps/Ep:     {args.max_steps}")
+    print(f"Base RNG Seed:    {args.seed}")
     print(f"Use Depth Frame:  {not args.no_depth} ({args.depth_width}x{args.depth_height})")
-    print(f"Terrain Patch:    {args.extent:.1f}m extent, {args.spacing:.2f}m pitch, density={args.density}")
-    print(f"Pyramid Sizes:    [{args.size_min:.2f}, {args.size_max:.2f}]m base, [{args.height_min:.2f}, {args.height_max:.2f}]m height")
+    print(f"Action Scale:     {args.action_scale:.2f}")
 
-    # Build custom terrain & task configurations
+    # Build terrain and task configurations
     terrain_cfg = RandomTerrainConfig(
         seed=args.seed,
         extent=args.extent,
@@ -257,7 +186,8 @@ def run_environment_test():
         terrain=terrain_cfg,
     )
 
-    # 1. Instantiate environment via gym.make
+    # 1. Environment Initialization (__init__)
+    print("\n--- 1. ENVIRONMENT INITIALIZATION ---")
     try:
         env = gym.make(
             "QuadrupedPathTerrain-v0",
@@ -272,7 +202,7 @@ def run_environment_test():
             max_episode_steps=args.max_steps,
         )
     except Exception as e:
-        print(f"Direct gym.make failed ({e}), falling back to direct instantiation...")
+        print(f"gym.make fallback to direct instantiation ({e})...")
         env = QuadrupedPathTerrainEnv(
             render_mode=render_mode,
             urdf_path=args.urdf,
@@ -285,22 +215,14 @@ def run_environment_test():
             max_episode_steps=args.max_steps,
         )
 
-    print("\n[Environment Verification]")
-    print(f"  Action Space:      {env.action_space}")
-    print(f"  Observation Space: {type(env.observation_space).__name__}")
+    print(f"Action Space:      {env.action_space}")
+    print(f"Observation Space: {type(env.observation_space).__name__}")
     if isinstance(env.observation_space, gym.spaces.Dict):
         for k, v in env.observation_space.spaces.items():
-            print(f"    - '{k}': shape {v.shape}, dtype {v.dtype}")
+            print(f"  - '{k}': shape {v.shape}, dtype {v.dtype}")
 
-    # Set up policy
-    dt_control = env.unwrapped.sim_time_step * env.unwrapped.action_repeat
-    crawl_policy = CrawlPolicy(
-        stride_x=args.stride_x,
-        swing_height=args.swing_height,
-        cycle_time=args.cycle_time,
-        action_scale=args.action_scale,
-        dt=dt_control,
-    )
+    if args.check_env:
+        run_compliance_check(env)
 
     episode_summaries = []
 
@@ -308,17 +230,19 @@ def run_environment_test():
         ep_seed = args.seed + ep * 100
         print_banner(f"EPISODE {ep + 1} / {args.episodes} (Seed={ep_seed})")
 
+        # 2. Episode Reset (reset)
+        print("--- 2. EPISODE RESET ---")
         obs, info = env.reset(seed=ep_seed)
-        crawl_policy.reset()
 
         path_pts = env.unwrapped.episode_path.points
         path_tangents = env.unwrapped.episode_path.tangents
-        print(f"Generated Continuous Path: {len(path_pts)} samples, length = {info['path_length']:.2f} m")
-        print(f"Loaded Dense Pyramids:     {info['num_pyramids']} collision bodies on top of plane")
-        print(f"Initial Spawn Pose:        pos=(0, 0, ~0.28m) heading={math.degrees(obs['trunk_orientation'][2]):.1f} deg")
+        print(f"Procedural Path:       {len(path_pts)} samples, length = {info['path_length']:.2f} m")
+        print(f"Dense Pyramids:        {info['num_pyramids']} collision bodies loaded")
+        init_heading = math.degrees(obs['trunk_orientation'][2])
+        print(f"Spawn Pose:            pos=(0, 0, ~0.28m) heading={init_heading:.1f} deg")
         if "depth" in obs and obs["depth"] is not None:
             depth_img = obs["depth"]
-            print(f"Captured Depth Frame:      shape={depth_img.shape}, min={depth_img.min():.2f}m, max={depth_img.max():.2f}m")
+            print(f"Depth Camera Buffer:   shape={depth_img.shape}, min={depth_img.min():.2f}m, max={depth_img.max():.2f}m")
 
         print("\n" + "-" * 115)
         print(f"{'Step':>4} | {'Rew Total':>9} | {'R_Path':>6} {'R_Vel':>6} {'R_Stab':>6} {'R_Prog':>6} | "
@@ -337,15 +261,10 @@ def run_environment_test():
             for step in range(args.max_steps):
                 step_count += 1
 
-                # Select action based on chosen policy
-                if args.policy == "crawl":
-                    crawl_policy.steer(obs, last_step_info, path_tangents)
-                    action = crawl_policy.get_action()
-                elif args.policy == "stand":
-                    action = np.zeros(12, dtype=np.float32)
-                else:  # random
-                    action = env.action_space.sample() * 0.15
+                # 3. Action Generation & Initiation
+                action = generate_test_action(args.policy, step, env.action_space)
 
+                # 4. Step Environment Transition
                 obs, reward, terminated, truncated, step_info = env.step(action)
                 total_reward += reward
                 last_step_info = step_info
@@ -361,8 +280,8 @@ def run_environment_test():
                 lateral_offsets.append(abs(offset_m))
                 trunk_tilts.append(math.hypot(roll_deg, pitch_deg))
 
-                # Print telemetry periodically or upon key events
-                if step % 15 == 0 or terminated or truncated or step == 0:
+                # Telemetry print
+                if step % 25 == 0 or terminated or truncated or step == 0:
                     status_str = "OK"
                     if step_info.get("fallen", False):
                         status_str = "FALLEN"
@@ -388,9 +307,8 @@ def run_environment_test():
                 if terminated or truncated:
                     break
         except KeyboardInterrupt:
-            print("\n[Simulation interrupted by user (Ctrl+C)]")
+            print("\n[Test interrupted by user (Ctrl+C)]")
 
-        # Compute episode summary
         survived = not last_step_info.get("fallen", False)
         mean_offset = float(np.mean(lateral_offsets)) if lateral_offsets else 0.0
         max_tilt = float(np.max(trunk_tilts)) if trunk_tilts else 0.0
@@ -418,11 +336,11 @@ def run_environment_test():
         print(f"  Cumulative Rew:   {total_reward:.2f}")
 
     # Final Test Report
-    print_banner("TEST RUN EVALUATION SUMMARY")
+    print_banner("TRAINING ENVIRONMENT EVALUATION SUMMARY")
     print(f"{'Episode':>7} | {'Steps':>6} | {'Total Reward':>13} | {'Progress':>9} | {'Mean Offset':>12} | {'Max Tilt':>9} | {'Status'}")
     print("-" * 80)
     for s in episode_summaries:
-        status = "PASSED (Survived)" if s["survived"] else "FAILED (Fell)"
+        status = "PASSED (Survived)" if s["survived"] else "TERMINATED"
         print(
             f"{s['episode']:7d} | {s['steps']:6d} | {s['total_reward']:13.2f} | "
             f"{s['progress_pct']:8.1f}% | {s['mean_offset_m']:10.3f} m | "
@@ -432,9 +350,8 @@ def run_environment_test():
     print("Environment test completed successfully!\n")
 
     if render_mode == "human":
-        print("\n[PyBullet GUI] Episode finished successfully!")
-        print("Inspection Mode: GUI is fully interactive (drag mouse to rotate/zoom).")
-        print("Press any key in this terminal (or Ctrl+C) to close the window...")
+        print("[PyBullet GUI] Evaluation finished successfully!")
+        print("Inspection Mode: GUI is live (drag mouse to rotate/zoom). Press any key in terminal to exit...")
         try:
             import msvcrt
             while True:

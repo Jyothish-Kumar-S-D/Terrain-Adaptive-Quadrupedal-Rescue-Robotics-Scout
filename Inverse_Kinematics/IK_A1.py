@@ -111,6 +111,7 @@ class LegStep:
     height: float = 0.10    # swing clearance
     stance_z: Optional[float] = None  # optional per-leg stance depth
     offset_y: float = 0.0   # lateral foot stance offset (+ left, - right)
+    swing_frac: Optional[float] = None  # per-leg swing fraction (step duration)
 
 
 @dataclass
@@ -177,13 +178,14 @@ class CycleCommand:
 # Gait generator
 # ----------------------------------------------------------------------
 class _LegState:
-    __slots__ = ("step", "z", "cg", "in_swing", "pos", "swing_from", "offset_y")
+    __slots__ = ("step", "z", "cg", "in_swing", "pos", "swing_from", "offset_y", "swing_frac")
 
     def __init__(self):
         self.step = LegStep()
         self.z = -0.22
         self.cg = 0.0
         self.offset_y = 0.0
+        self.swing_frac = 0.15
         self.in_swing = False
         self.pos: Vec3 = (0.0, 0.0, -0.22)
         self.swing_from: Vec3 = self.pos
@@ -227,7 +229,8 @@ class CrawlGait:
         for n, st in self.legs.items():
             self._latch(n, st, command)
             lp = (self.cycle_phase + command.phase_offset[n]) % 1.0
-            st.pos = self._stance_pos(st, self._stance_s(lp, command))
+            sw_frac = st.step.swing_frac if st.step.swing_frac is not None else command.swing_frac
+            st.pos = self._stance_pos(st, self._stance_s(lp, sw_frac))
             st.swing_from = st.pos
 
     # -- public API ---------------------------------------------------
@@ -254,7 +257,8 @@ class CrawlGait:
 
         for n, st in self.legs.items():
             lp = (self.cycle_phase + cmd.phase_offset[n]) % 1.0
-            if lp < cmd.swing_frac:
+            sw_frac = st.step.swing_frac if st.step.swing_frac is not None else cmd.swing_frac
+            if lp < sw_frac:
                 if not st.in_swing:
                     self._latch(n, st, cmd)
                     st.in_swing = True
@@ -265,10 +269,10 @@ class CrawlGait:
                         st.swing_from = (af[0], af[1], max(st.pos[2], af[2]))
                     else:
                         st.swing_from = st.pos
-                st.pos = self._swing_pos(st, lp / cmd.swing_frac)
+                st.pos = self._swing_pos(st, lp / sw_frac if sw_frac > 0 else 1.0)
             else:
                 st.in_swing = False
-                st.pos = self._stance_pos(st, self._stance_s(lp, cmd))
+                st.pos = self._stance_pos(st, self._stance_s(lp, sw_frac))
 
             x = nx + w * (st.pos[0] - nx)
             y = ny + w * (st.pos[1] - ny)
@@ -292,10 +296,15 @@ class CrawlGait:
         st.z = cmd.legs[leg].stance_z if cmd.legs[leg].stance_z is not None else cmd.stance_z
         st.cg = cmd.cg_offset_x
         st.offset_y = cmd.legs[leg].offset_y if cmd.legs[leg].offset_y != 0.0 else (SIDE[leg] * cmd.stance_width)
+        st.swing_frac = cmd.legs[leg].swing_frac if cmd.legs[leg].swing_frac is not None else cmd.swing_frac
 
     @staticmethod
-    def _stance_s(lp, cmd):
-        return (lp - cmd.swing_frac) / (1.0 - cmd.swing_frac)
+    def _stance_s(lp, sw_frac):
+        if isinstance(sw_frac, CycleCommand):
+            sw_frac = sw_frac.swing_frac
+        if sw_frac >= 1.0:
+            return 0.0
+        return (lp - sw_frac) / (1.0 - sw_frac)
 
     @staticmethod
     def _stance_pos(st: _LegState, s: float) -> Vec3:
