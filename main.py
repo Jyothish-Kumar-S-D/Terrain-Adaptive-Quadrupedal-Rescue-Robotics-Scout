@@ -164,16 +164,25 @@ def _command_turn(command):
     return max(-1.0, min(1.0, (right_stride - left_stride) / average))
 
 
-def policy_state(robot_id):
+def policy_state(robot_id, path=None):
     """Compact state paired with depth for the PPO policy."""
     position, quaternion = p.getBasePositionAndOrientation(robot_id)
     linear_velocity, angular_velocity = p.getBaseVelocity(robot_id)
     roll, pitch, yaw = p.getEulerFromQuaternion(quaternion)
+    route_features = (0.0, 0.0, 0.0, 0.0)
+    if path is not None:
+        _, distance, lateral_offset, tangent = path.nearest(position[:2])
+        route_features = (
+            float(tangent[0]), float(tangent[1]),
+            float(np.clip(lateral_offset / 2.0, -1.0, 1.0)),
+            float(np.clip(distance / 2.0, 0.0, 1.0)),
+        )
     return np.asarray([
         roll / math.pi, pitch / math.pi, math.sin(yaw), math.cos(yaw),
         *np.clip(np.asarray(linear_velocity) / 2.0, -1.0, 1.0),
         *np.clip(np.asarray(angular_velocity) / 4.0, -1.0, 1.0),
         float(position[2]) / 0.5,
+        *route_features,
     ], dtype=np.float32)
 
 
@@ -268,7 +277,7 @@ def main():
                 and latest_depth is not None
                 and time.monotonic() - last_policy_update >= policy_update_interval
             ):
-                state = policy_state(robot_id)
+                state = policy_state(robot_id, route)
                 observation = depth_observation(latest_depth, state)
                 policy_action = controller.predict(observation)
                 last_policy_update = time.monotonic()
@@ -294,7 +303,7 @@ def main():
             if now - last_cloud_update >= 0.1:
                 depth, segmentation = camera.capture_frame()
                 latest_depth = depth
-                frame_store.save(depth, policy_state(robot_id))
+                frame_store.save(depth, policy_state(robot_id, route))
                 points, colors = depth_to_point_cloud(
                     depth, camera, stride=6, segmentation=segmentation,
                 )
