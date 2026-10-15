@@ -92,6 +92,53 @@ MAX_MOTOR_FORCE = 33.5
 MAX_MOTOR_VELOCITY = 21.0
 
 # ----------------------------------------------------------------------
+# 18-Dimensional Task-Space Corrective Action Space definition
+# (Gangapurwala et al., ICRA 2021, "Real-Time Trajectory Adaptation for Quadrupedal
+# Locomotion using Deep Reinforcement Learning"):
+# - delta_P_base (3 params: x, y, z base translation) in meters
+# - delta_O_base (3 params: roll, pitch, yaw base rotation) in radians
+# - delta_P_feet (12 params: x, y, z for FR, FL, RR, RL feet) in meters
+# ----------------------------------------------------------------------
+CORRECTIVE_ACTION_NAMES = [
+    # 0..2: additive base position deviation (x, y, z) in meters
+    "delta_base_x", "delta_base_y", "delta_base_z",
+    # 3..5: additive base orientation deviation (roll, pitch, yaw) in radians
+    "delta_base_roll", "delta_base_pitch", "delta_base_yaw",
+    # 6..8: additive foot position deviation FR (x, y, z) in meters
+    "delta_foot_FR_x", "delta_foot_FR_y", "delta_foot_FR_z",
+    # 9..11: additive foot position deviation FL (x, y, z) in meters
+    "delta_foot_FL_x", "delta_foot_FL_y", "delta_foot_FL_z",
+    # 12..14: additive foot position deviation RR (x, y, z) in meters
+    "delta_foot_RR_x", "delta_foot_RR_y", "delta_foot_RR_z",
+    # 15..17: additive foot position deviation RL (x, y, z) in meters
+    "delta_foot_RL_x", "delta_foot_RL_y", "delta_foot_RL_z",
+]
+
+# Physical maximum deviation scales corresponding to normalized actions in [-1.0, 1.0]
+CORRECTIVE_ACTION_SCALES = np.array([
+    0.04, 0.03, 0.04,   # delta base position (m)
+    0.15, 0.15, 0.15,   # delta base orientation (rad, ~8.6 deg)
+    0.05, 0.03, 0.06,   # FR foot position (m)
+    0.05, 0.03, 0.06,   # FL foot position (m)
+    0.05, 0.03, 0.06,   # RR foot position (m)
+    0.05, 0.03, 0.06,   # RL foot position (m)
+], dtype=np.float32)
+
+# Hip joint offsets relative to base CoM from URDF (xyz="±0.1805 ±0.047 0")
+A1_HIP_OFFSETS: Dict[str, np.ndarray] = {
+    "FR": np.array([0.1805, -0.047, 0.0], dtype=np.float32),
+    "FL": np.array([0.1805,  0.047, 0.0], dtype=np.float32),
+    "RR": np.array([-0.1805, -0.047, 0.0], dtype=np.float32),
+    "RL": np.array([-0.1805,  0.047, 0.0], dtype=np.float32),
+}
+
+
+def get_nominal_corrective_action() -> np.ndarray:
+    """Return nominal zero-deviation corrective action vector in [-1.0, 1.0]^18."""
+    return np.zeros(len(CORRECTIVE_ACTION_NAMES), dtype=np.float32)
+
+
+# ----------------------------------------------------------------------
 # 26-Dimensional Action Space definition for high-level gait cycle generation:
 # - phase offset for each leg (4 parameters: FR, FL, RR, RL) in [0.0, 1.0)
 # - step duration / swing fraction for each leg (4 parameters: FR, FL, RR, RL) in [0.10, 0.35]
@@ -258,13 +305,15 @@ class QuadrupedPathTerrainEnv(gym.Env):
         task_config: Optional[PathTaskConfig] = None,
         terrain_config: Optional[RandomTerrainConfig] = None,
         action_scale: float = 1.0,
+        action_mode: str = "corrective",
+        control_step_dt: float = 0.05,
         depth_width: int = 64,
         depth_height: int = 48,
         use_depth: bool = True,
         flatten_obs: bool = False,
         sim_time_step: float = 1.0 / 240.0,
         action_repeat: int = 4,
-        max_episode_steps: int = 100,
+        max_episode_steps: int = 1200,
         render_path_in_gui: bool = True,
         depth_capture_interval: int = 5,
         randomize_friction: bool = True,
@@ -284,6 +333,10 @@ class QuadrupedPathTerrainEnv(gym.Env):
         self.render_mode = render_mode
         self.render_path_in_gui = render_path_in_gui
         self.action_scale = float(action_scale)
+        self.action_mode = str(action_mode).lower()
+        if self.action_mode not in ("corrective", "gait_cycle"):
+            raise ValueError(f"Unknown action_mode: '{action_mode}'. Supported: 'corrective', 'gait_cycle'.")
+        self.control_step_dt = float(control_step_dt)
         self.depth_width = int(depth_width)
         self.depth_height = int(depth_height)
         self.use_depth = bool(use_depth)
@@ -315,16 +368,27 @@ class QuadrupedPathTerrainEnv(gym.Env):
 
         self.terrain_config = self.task_config.terrain
 
-        # 26-Dimensional continuous action space [-1.0, 1.0] for high-level gait cycle
-        self.action_param_names = list(ACTION_PARAM_NAMES)
-        self.action_space = spaces.Box(
-            low=-1.0,
-            high=1.0,
-            shape=(len(ACTION_PARAM_NAMES),),
-            dtype=np.float32,
-        )
+        # Action space configuration
+        if self.action_mode == "corrective":
+            # 18D continuous task-space residual deviations [-1.0, 1.0] (Gangapurwala et al., ICRA 2021)
+            self.action_param_names = list(CORRECTIVE_ACTION_NAMES)
+            self.action_space = spaces.Box(
+                low=-1.0,
+                high=1.0,
+                shape=(len(CORRECTIVE_ACTION_NAMES),),
+                dtype=np.float32,
+            )
+        else:
+            # 26D continuous gait cycle parameter space [-1.0, 1.0]
+            self.action_param_names = list(ACTION_PARAM_NAMES)
+            self.action_space = spaces.Box(
+                low=-1.0,
+                high=1.0,
+                shape=(len(ACTION_PARAM_NAMES),),
+                dtype=np.float32,
+            )
 
-        # Observation spaces
+        # Observation spaces (incorporating Paper Section IV-B and Table I features)
         dict_obs_spaces = {
             "joint_positions": spaces.Box(
                 low=JOINT_LOWER_LIMITS - 0.10,
@@ -349,18 +413,30 @@ class QuadrupedPathTerrainEnv(gym.Env):
                 shape=(3,),
                 dtype=np.float32,
             ),  # trunk linear velocity [m/s]
+            "base_angular_velocity": spaces.Box(
+                low=-20.0,
+                high=20.0,
+                shape=(3,),
+                dtype=np.float32,
+            ),  # trunk angular velocity [rad/s]
             "foot_contacts": spaces.Box(
                 low=0.0,
                 high=1.0,
                 shape=(4,),
                 dtype=np.float32,
             ),  # binary contact flags: FR, FL, RR, RL
+            "foot_velocities": spaces.Box(
+                low=0.0,
+                high=20.0,
+                shape=(4,),
+                dtype=np.float32,
+            ),  # linear velocity magnitudes of the 4 feet (for slip penalty)
             "previous_action": spaces.Box(
                 low=-1.0,
                 high=1.0,
-                shape=(len(ACTION_PARAM_NAMES),),
+                shape=self.action_space.shape,
                 dtype=np.float32,
-            ),  # last cycle action for temporal context
+            ),  # last applied action for temporal continuity
             "path_offset": spaces.Box(
                 low=-20.0,
                 high=20.0,
@@ -379,6 +455,24 @@ class QuadrupedPathTerrainEnv(gym.Env):
                 shape=(1,),
                 dtype=np.float32,
             ),  # angle between velocity & path tangent
+            "short_horizon_goal": spaces.Box(
+                low=-20.0,
+                high=20.0,
+                shape=(3,),
+                dtype=np.float32,
+            ),  # relative displacement vector to lookahead waypoint in base frame
+            "height_map": spaces.Box(
+                low=-2.0,
+                high=2.0,
+                shape=(36,),
+                dtype=np.float32,
+            ),  # 6x6 local terrain elevation grid centered at base (Paper IV-B.2)
+            "foot_terrain_clearances": spaces.Box(
+                low=-2.0,
+                high=2.0,
+                shape=(4,),
+                dtype=np.float32,
+            ),  # terrain clearance below each foot (Paper Table I)
         }
 
         if self.use_depth:
@@ -393,9 +487,7 @@ class QuadrupedPathTerrainEnv(gym.Env):
         self._dict_observation_space = spaces.Dict(dict_obs_spaces)
 
         if self.flatten_obs:
-            flat_dim = 12 + 12 + 3 + 3 + 4 + len(ACTION_PARAM_NAMES) + 1 + 1 + 1
-            if self.use_depth:
-                flat_dim += self.depth_height * self.depth_width
+            flat_dim = sum(int(np.prod(space.shape)) for space in dict_obs_spaces.values())
             self.observation_space = spaces.Box(
                 low=-np.inf,
                 high=np.inf,
@@ -429,8 +521,15 @@ class QuadrupedPathTerrainEnv(gym.Env):
         # Depth camera projection matrix
         self._camera_proj_matrix = None
 
-        # Temporal context: previous cycle action and cached depth frame
-        self._previous_action = get_nominal_cycle_action()
+        # Temporal context: previous action, velocities, and cached depth frame
+        self._previous_action = (
+            get_nominal_corrective_action()
+            if self.action_mode == "corrective"
+            else get_nominal_cycle_action()
+        )
+        self._previous_joint_positions = NOMINAL_JOINT_ANGLES.copy()
+        self._previous_joint_velocities = np.zeros(12, dtype=np.float32)
+        self._previous_foot_velocities = np.zeros(4, dtype=np.float32)
         self._cached_depth_frame: Optional[np.ndarray] = None
         self._depth_step_counter: int = 0
 
@@ -730,24 +829,131 @@ class QuadrupedPathTerrainEnv(gym.Env):
                 contacts[i] = 1.0
         return contacts
 
-    def _get_obs(self) -> Dict[str, np.ndarray]:
-        """Compute full observation space.
+    def _get_base_angular_velocity(self) -> np.ndarray:
+        """Get base angular velocity [wx, wy, wz] in rad/s (Paper Section IV-A/IV-B)."""
+        if self.dry_run or p is None or self.robot_id is None:
+            return np.zeros(3, dtype=np.float32)
+        try:
+            _, ang_vel = p.getBaseVelocity(self.robot_id)
+            return np.array(ang_vel, dtype=np.float32)
+        except Exception:
+            return np.zeros(3, dtype=np.float32)
 
-        Includes:
-        - Joint states (positions and velocities)
-        - Foot contact flags (4 binary values)
-        - Previous action (temporal context)
-        - Base linear velocity
-        - Downscaled depth frame (cached, updated every N steps)
-        - Trunk orientation
-        - Path offset and distance
-        - Angle between robot velocity and path tangent
+    def _get_foot_velocities(self) -> np.ndarray:
+        """Get foot linear velocity magnitudes for FR, FL, RR, RL (Paper Table I Foot Slip)."""
+        if self.dry_run or p is None or self.robot_id is None:
+            return np.zeros(4, dtype=np.float32)
+        vels = np.zeros(4, dtype=np.float32)
+        for i, foot_idx in enumerate(self.foot_link_indices):
+            try:
+                state = p.getLinkState(self.robot_id, foot_idx, computeLinkVelocity=1)
+                lin_vel = state[6]
+                vels[i] = float(np.linalg.norm(lin_vel))
+            except Exception:
+                vels[i] = 0.0
+        return vels
+
+    def _get_local_height_map(self, base_pos: np.ndarray, yaw: float) -> np.ndarray:
+        """Sample 6x6 local terrain elevation grid centered at robot base (Paper Section IV-B.2).
+        
+        The grid covers an area of 1.0 x 1.0 m aligned with the robot's heading and lateral axes.
+        Elevations are relative to base z, clipped between [-2.0, 2.0] m.
         """
+        if self.dry_run or p is None:
+            return np.zeros(36, dtype=np.float32)
+
+        coords = np.linspace(-0.5, 0.5, 6)
+        gx, gy = np.meshgrid(coords, coords)
+        local_x = gx.ravel()
+        local_y = gy.ravel()
+
+        cos_yaw = math.cos(yaw)
+        sin_yaw = math.sin(yaw)
+
+        world_x = base_pos[0] + cos_yaw * local_x - sin_yaw * local_y
+        world_y = base_pos[1] + sin_yaw * local_x + cos_yaw * local_y
+        z_base = float(base_pos[2])
+
+        ray_froms = [[float(wx), float(wy), z_base + 0.8] for wx, wy in zip(world_x, world_y)]
+        ray_tos = [[float(wx), float(wy), z_base - 0.8] for wx, wy in zip(world_x, world_y)]
+
+        try:
+            results = p.rayTestBatch(ray_froms, ray_tos)
+            elevations = np.zeros(36, dtype=np.float32)
+            for i, res in enumerate(results):
+                if res[0] >= 0:
+                    elevations[i] = float(res[3][2] - z_base)
+                else:
+                    elevations[i] = -z_base
+            return np.clip(elevations, -2.0, 2.0).astype(np.float32)
+        except Exception:
+            return np.zeros(36, dtype=np.float32)
+
+    def _get_foot_terrain_clearances(self) -> np.ndarray:
+        """Measure vertical clearance between each foot and terrain ground surface (Paper Table I Foot Clearance)."""
+        if self.dry_run or p is None or self.robot_id is None or not self.foot_link_indices:
+            return np.zeros(4, dtype=np.float32)
+
+        clearances = np.zeros(4, dtype=np.float32)
+        ray_froms = []
+        ray_tos = []
+        foot_zs = []
+
+        for foot_idx in self.foot_link_indices:
+            try:
+                state = p.getLinkState(self.robot_id, foot_idx)
+                f_pos = state[0]
+                foot_zs.append(float(f_pos[2]))
+                ray_froms.append([float(f_pos[0]), float(f_pos[1]), float(f_pos[2]) + 0.3])
+                ray_tos.append([float(f_pos[0]), float(f_pos[1]), float(f_pos[2]) - 0.5])
+            except Exception:
+                foot_zs.append(0.0)
+                ray_froms.append([0.0, 0.0, 0.3])
+                ray_tos.append([0.0, 0.0, -0.5])
+
+        try:
+            results = p.rayTestBatch(ray_froms, ray_tos)
+            for i, res in enumerate(results):
+                if res[0] >= 0:
+                    clearances[i] = float(foot_zs[i] - res[3][2])
+                else:
+                    clearances[i] = float(foot_zs[i])
+            return np.clip(clearances, -1.0, 1.0).astype(np.float32)
+        except Exception:
+            return np.zeros(4, dtype=np.float32)
+
+    def _get_short_horizon_goal(
+        self, base_pos: np.ndarray, yaw: float, horizon_dist: float = 0.5
+    ) -> np.ndarray:
+        """Displacement vector to lookahead path waypoint in base frame (Paper Section IV-B.1 C^{traj}_{t+H})."""
+        if self.episode_path is None or len(self.episode_path.points) == 0:
+            return np.zeros(3, dtype=np.float32)
+
+        nearest_idx, _, _, _ = self.episode_path.nearest(base_pos[:2])
+        pts = self.episode_path.points
+        total_len = len(pts)
+        step_ahead = max(1, int(round(horizon_dist / max(self.task_config.path_length / max(total_len, 1), 1e-4))))
+        lookahead_idx = min(nearest_idx + step_ahead, total_len - 1)
+
+        goal_world = np.array([pts[lookahead_idx][0], pts[lookahead_idx][1], base_pos[2]], dtype=np.float32)
+        delta_world = goal_world - base_pos
+
+        cos_yaw = math.cos(-yaw)
+        sin_yaw = math.sin(-yaw)
+        dx_base = cos_yaw * delta_world[0] - sin_yaw * delta_world[1]
+        dy_base = sin_yaw * delta_world[0] + cos_yaw * delta_world[1]
+        dz_base = delta_world[2]
+
+        return np.array([dx_base, dy_base, dz_base], dtype=np.float32)
+
+    def _get_obs(self) -> Dict[str, np.ndarray]:
+        """Compute full observation space (Paper Section IV-B & Table I)."""
         if self.dry_run:
             joint_positions = self._sim_joints.copy()
             joint_velocities = self._sim_joint_vels.copy()
             pos = self._sim_pos
             linear_velocity = self._sim_vel
+            base_ang_vel = np.zeros(3, dtype=np.float32)
             trunk_roll, trunk_pitch, trunk_yaw = float(self._sim_rpy[0]), float(self._sim_rpy[1]), float(self._sim_rpy[2])
             nearest_idx, distance, lateral_offset, tangent = self.episode_path.nearest(pos[:2])
 
@@ -761,6 +967,10 @@ class QuadrupedPathTerrainEnv(gym.Env):
                 velocity_angle = 0.0
 
             foot_contacts = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+            foot_velocities = np.zeros(4, dtype=np.float32)
+            foot_clearances = np.zeros(4, dtype=np.float32)
+            short_horizon_goal = self._get_short_horizon_goal(pos, trunk_yaw)
+            height_map = np.zeros(36, dtype=np.float32)
             depth = np.zeros((self.depth_height, self.depth_width), dtype=np.float32) if self.use_depth else None
         elif p is None or self.robot_id is None:
             joint_positions = NOMINAL_JOINT_ANGLES.copy()
@@ -770,20 +980,30 @@ class QuadrupedPathTerrainEnv(gym.Env):
             distance = 0.0
             velocity_angle = 0.0
             foot_contacts = np.zeros(4, dtype=np.float32)
+            foot_velocities = np.zeros(4, dtype=np.float32)
+            foot_clearances = np.zeros(4, dtype=np.float32)
+            short_horizon_goal = np.zeros(3, dtype=np.float32)
+            height_map = np.zeros(36, dtype=np.float32)
             depth = np.zeros((self.depth_height, self.depth_width), dtype=np.float32) if self.use_depth else None
             nearest_idx = 0
             linear_velocity = np.zeros(3, dtype=np.float32)
+            base_ang_vel = np.zeros(3, dtype=np.float32)
         else:
             joint_states = p.getJointStates(self.robot_id, self.joint_indices)
             joint_positions = np.array([s[0] for s in joint_states], dtype=np.float32)
             joint_velocities = np.array([s[1] for s in joint_states], dtype=np.float32)
 
             pos, _ = p.getBasePositionAndOrientation(self.robot_id)
-            lin_vel, _ = p.getBaseVelocity(self.robot_id)
+            lin_vel, ang_vel = p.getBaseVelocity(self.robot_id)
             linear_velocity = np.array(lin_vel, dtype=np.float32)
+            base_ang_vel = np.array(ang_vel, dtype=np.float32)
 
             trunk_roll, trunk_pitch, trunk_yaw = self._get_trunk_orientation()
             foot_contacts = self._get_foot_contacts()
+            foot_velocities = self._get_foot_velocities()
+            foot_clearances = self._get_foot_terrain_clearances()
+            height_map = self._get_local_height_map(np.array(pos, dtype=np.float32), trunk_yaw)
+            short_horizon_goal = self._get_short_horizon_goal(np.array(pos, dtype=np.float32), trunk_yaw)
 
             # Path metrics
             nearest_idx, distance, lateral_offset, tangent = self.episode_path.nearest(pos[:2])
@@ -812,11 +1032,16 @@ class QuadrupedPathTerrainEnv(gym.Env):
             "joint_velocities": joint_velocities,
             "trunk_orientation": np.array([trunk_roll, trunk_pitch, trunk_yaw], dtype=np.float32),
             "base_linear_velocity": np.array(linear_velocity, dtype=np.float32).copy(),
+            "base_angular_velocity": np.array(base_ang_vel, dtype=np.float32).copy(),
             "foot_contacts": foot_contacts,
+            "foot_velocities": foot_velocities,
             "previous_action": self._previous_action.copy(),
             "path_offset": np.array([lateral_offset], dtype=np.float32),
             "path_distance": np.array([distance], dtype=np.float32),
             "velocity_tangent_angle": np.array([velocity_angle], dtype=np.float32),
+            "short_horizon_goal": short_horizon_goal,
+            "height_map": height_map,
+            "foot_terrain_clearances": foot_clearances,
         }
         if self.use_depth:
             obs_dict["depth"] = depth
@@ -830,27 +1055,21 @@ class QuadrupedPathTerrainEnv(gym.Env):
             "trunk_pitch": trunk_pitch,
             "trunk_yaw": trunk_yaw,
             "base_linear_velocity": np.array(linear_velocity, dtype=np.float32).copy(),
+            "base_angular_velocity": np.array(base_ang_vel, dtype=np.float32).copy(),
+            "foot_clearances": foot_clearances.copy(),
+            "foot_velocities": foot_velocities.copy(),
         }
         return obs_dict
 
     def _format_obs(self, obs_dict: Dict[str, np.ndarray]) -> Union[Dict[str, np.ndarray], np.ndarray]:
-        """Convert obs dict to flat array if flatten_obs is True."""
+        """Convert obs dict to flat array if flatten_obs is True in canonical dict order."""
         if not self.flatten_obs:
             return obs_dict
 
-        flat_parts = [
-            obs_dict["joint_positions"],
-            obs_dict["joint_velocities"],
-            obs_dict["trunk_orientation"],
-            obs_dict["base_linear_velocity"],
-            obs_dict["foot_contacts"],
-            obs_dict["previous_action"],
-            obs_dict["path_offset"],
-            obs_dict["path_distance"],
-            obs_dict["velocity_tangent_angle"],
-        ]
-        if self.use_depth:
-            flat_parts.append(obs_dict["depth"].flatten())
+        flat_parts = []
+        for key in self._dict_observation_space.spaces.keys():
+            if key in obs_dict and obs_dict[key] is not None:
+                flat_parts.append(obs_dict[key].flatten())
         return np.concatenate(flat_parts).astype(np.float32)
 
     def get_nominal_action(self) -> np.ndarray:
@@ -960,6 +1179,98 @@ class QuadrupedPathTerrainEnv(gym.Env):
             dt_cycle=self.sim_time_step * self.action_repeat,
         )
 
+    def _compute_paper_reward(
+        self,
+        action: np.ndarray,
+        obs_dict: Dict[str, np.ndarray],
+        joint_positions: np.ndarray,
+        joint_velocities: np.ndarray,
+        foot_velocities: np.ndarray,
+        progress: float,
+        terminated: bool,
+        dt_step: float,
+    ) -> Tuple[float, Dict[str, float]]:
+        """Multi-objective trajectory tracking and stability reward (Gangapurwala et al., ICRA 2021, Table I)."""
+        cfg = self.task_config
+
+        # 1. Trajectory Tracking error ||P_base^m - P_base^traj||^2
+        dist_to_path = float(obs_dict["path_distance"][0])
+        path_tol = max(cfg.path_tolerance, 1e-4)
+        reward_tracking = math.exp(-0.5 * (dist_to_path / path_tol) ** 2)
+
+        # 2. Short Horizon Goal progress: lookahead progress
+        reward_goal = float(progress) * 4.0
+
+        # 3. Base Orientation stability: ||O_base^{x,y,z} - [0,0,O_base^z]||^2 = roll^2 + pitch^2
+        roll = float(obs_dict["trunk_orientation"][0])
+        pitch = float(obs_dict["trunk_orientation"][1])
+        orientation_error = roll * roll + pitch * pitch
+        reward_orientation = math.exp(-0.5 * orientation_error / (0.25 ** 2))
+
+        # 4. Foot Slip penalty: ||v_foot_world||^2 for feet with contact > 0
+        contacts = obs_dict["foot_contacts"]
+        foot_slip_penalty = float(np.sum(contacts * np.square(foot_velocities)))
+
+        # 5. Foot Clearance: (fh - f_des)^2 * ||v_foot||^2 during swing (contacts == 0)
+        clearances = obs_dict["foot_terrain_clearances"]
+        des_clearance = 0.08
+        swing_mask = 1.0 - contacts
+        foot_clearance_penalty = float(
+            np.sum(swing_mask * np.square(clearances - des_clearance) * np.square(foot_velocities))
+        )
+
+        # 6. Smoothness: ||J_t - J_{t-1}||^2
+        joint_delta = joint_positions - self._previous_joint_positions
+        smoothness_penalty = float(np.sum(np.square(joint_delta)))
+
+        # 7. Joint Velocity penalty: ||J_dot_t||^2
+        joint_vel_penalty = float(np.sum(np.square(joint_velocities)))
+
+        # 8. Joint Acceleration penalty: ||J_ddot_t||^2
+        joint_acc = (joint_velocities - self._previous_joint_velocities) / max(dt_step, 1e-4)
+        joint_acc_penalty = float(np.mean(np.square(joint_acc)))
+
+        # 9. Action rate penalty & energy
+        action_delta = action - self._previous_action
+        action_rate_penalty = float(np.mean(np.square(action_delta)))
+        energy_penalty = float(np.mean(np.square(action)))
+
+        # 10. Stability margin bonus / survival
+        stability_bonus = 0.5 if (not terminated and abs(roll) < 0.35 and abs(pitch) < 0.35) else 0.0
+        fall_penalty = -10.0 if terminated else 0.0
+
+        step_reward = (
+            2.0 * reward_tracking
+            + reward_goal
+            + 1.5 * reward_orientation
+            + stability_bonus
+            - 0.5 * foot_slip_penalty
+            - 0.3 * foot_clearance_penalty
+            - 0.1 * smoothness_penalty
+            - 0.01 * joint_vel_penalty
+            - 0.001 * joint_acc_penalty
+            - 0.05 * action_rate_penalty
+            - 0.02 * energy_penalty
+            + fall_penalty
+        )
+
+        components = {
+            "reward_tracking": float(reward_tracking),
+            "reward_goal": float(reward_goal),
+            "reward_orientation": float(reward_orientation),
+            "stability_bonus": float(stability_bonus),
+            "foot_slip_penalty": float(foot_slip_penalty),
+            "foot_clearance_penalty": float(foot_clearance_penalty),
+            "smoothness_penalty": float(smoothness_penalty),
+            "joint_vel_penalty": float(joint_vel_penalty),
+            "joint_acc_penalty": float(joint_acc_penalty),
+            "action_rate_penalty": float(action_rate_penalty),
+            "energy_penalty": float(energy_penalty),
+            "fall_penalty": float(fall_penalty),
+            "total_reward": float(step_reward),
+        }
+        return float(step_reward), components
+
     def reset(
         self,
         *,
@@ -976,7 +1287,14 @@ class QuadrupedPathTerrainEnv(gym.Env):
             rng = self.np_random
         self.episode_step_count = 0
         self._last_progress_index = 0
-        self._previous_action = get_nominal_cycle_action()
+        self._previous_action = (
+            get_nominal_corrective_action()
+            if self.action_mode == "corrective"
+            else get_nominal_cycle_action()
+        )
+        self._previous_joint_positions = NOMINAL_JOINT_ANGLES.copy()
+        self._previous_joint_velocities = np.zeros(12, dtype=np.float32)
+        self._previous_foot_velocities = np.zeros(4, dtype=np.float32)
         self._cached_depth_frame = None
         self._depth_step_counter = 0
 
@@ -1025,9 +1343,9 @@ class QuadrupedPathTerrainEnv(gym.Env):
         # Reset robot base and joints to nominal standing configuration
         self._reset_robot_pose()
 
-        # Initialize CrawlGait for cycle execution
-        init_cmd = action_to_cycle_command(self._previous_action)
-        self.gait = CrawlGait(init_cmd, blend_time=0.0)
+        # Initialize CrawlGait for reference trajectory generation
+        nominal_cycle_cmd = action_to_cycle_command(get_nominal_cycle_action())
+        self.gait = CrawlGait(nominal_cycle_cmd, blend_time=0.0)
         self.gait.cycle_phase = 0.0
 
         self.episode_index += 1
@@ -1036,6 +1354,7 @@ class QuadrupedPathTerrainEnv(gym.Env):
         obs = self._format_obs(obs_dict)
         info = {
             "episode_index": int(self.episode_index),
+            "action_mode": str(self.action_mode),
             "path_length": float(self.task_config.path_length),
             "num_pyramids": int(len(self.terrain_ids)),
             "path_index": int(self._current_info_metrics["path_index"]),
@@ -1052,7 +1371,7 @@ class QuadrupedPathTerrainEnv(gym.Env):
     def step(
         self, action: np.ndarray
     ) -> Tuple[Union[Dict[str, np.ndarray], np.ndarray], float, bool, bool, Dict[str, Any]]:
-        """Apply gait cycle action, execute one complete cycle, return transition tuple."""
+        """Apply action, execute trajectory, return transition tuple."""
         self.episode_step_count += 1
         action = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
         if action.shape != self.action_space.shape:
@@ -1060,19 +1379,8 @@ class QuadrupedPathTerrainEnv(gym.Env):
                 f"Action shape mismatch: expected {self.action_space.shape}, got {action.shape}"
             )
 
-        cmd = action_to_cycle_command(action)
-
-        if self.gait is None:
-            self.gait = CrawlGait(cmd, blend_time=0.0)
-            self.gait.cycle_phase = 0.0
-        else:
-            self.gait.cmd = cmd
-
-        dt_ctrl = self.sim_time_step * self.action_repeat
-        n_substeps = max(1, int(round(cmd.cycle_time / dt_ctrl)))
-        dt_gait = cmd.cycle_time / float(n_substeps)
-
         start_progress_idx = int(self._current_info_metrics.get("path_index", 0))
+        dt_ctrl = self.sim_time_step * self.action_repeat
 
         fallen = False
         far_from_path = False
@@ -1081,106 +1389,333 @@ class QuadrupedPathTerrainEnv(gym.Env):
         truncated = False
         last_substep = 0
 
-        for substep in range(n_substeps):
-            last_substep = substep
-            joint_targets = self.gait.update(dt_gait)
-            targets_ordered = []
-            for leg in ("FR", "FL", "RR", "RL"):
-                targets_ordered.extend(joint_targets[leg])
-            target_positions = np.clip(targets_ordered, JOINT_LOWER_LIMITS, JOINT_UPPER_LIMITS)
+        if self.action_mode == "corrective":
+            # ------------------------------------------------------------------
+            # Task-Space Residual Correction (Gangapurwala et al., ICRA 2021)
+            # Additive deviations over nominal crawl reference trajectory setpoints
+            # ------------------------------------------------------------------
+            dt_step = self.control_step_dt
+            n_substeps = max(1, int(round(dt_step / dt_ctrl)))
+            dt_sub = dt_step / float(n_substeps)
 
-            if self.dry_run:
-                self._sim_joints = target_positions.astype(np.float32).copy()
-                if self.episode_path is not None:
-                    _, _, _, tangent = self.episode_path.nearest(self._sim_pos[:2])
-                    mean_length_x = float(np.mean([cmd.legs[n].length_x for n in LEG_NAMES]))
-                    motion_speed = mean_length_x / cmd.cycle_time if cmd.cycle_time > 0 else 0.0
-                    self._sim_pos[:2] += tangent * (motion_speed * dt_ctrl)
-                    self._sim_vel[:2] = tangent * motion_speed
-            elif p is not None and self.robot_id is not None:
-                for j_idx, target_q in zip(self.joint_indices, target_positions):
-                    p.setJointMotorControl2(
-                        self.robot_id,
-                        j_idx,
-                        p.POSITION_CONTROL,
-                        targetPosition=float(target_q),
-                        force=MAX_MOTOR_FORCE,
-                    )
-                for _ in range(self.action_repeat):
-                    p.stepSimulation()
-                if self.render_mode == "human":
-                    import time
-                    time.sleep(dt_ctrl)
+            # Scaled additive task-space deviations
+            deviations = action * CORRECTIVE_ACTION_SCALES
+            delta_P_base = deviations[0:3]
+            delta_O_base = deviations[3:6]
+            delta_P_feet = {
+                "FR": deviations[6:9],
+                "FL": deviations[9:12],
+                "RR": deviations[12:15],
+                "RL": deviations[15:18],
+            }
 
-            # Substep termination check
-            if self.dry_run:
-                base_z = float(self._sim_pos[2])
-                roll, pitch = float(self._sim_rpy[0]), float(self._sim_rpy[1])
-                nearest_idx, dist_to_path, _, _ = self.episode_path.nearest(self._sim_pos[:2])
-            elif p is not None and self.robot_id is not None:
-                try:
-                    pos, _ = p.getBasePositionAndOrientation(self.robot_id)
-                    base_z = float(pos[2])
-                    roll, pitch, _ = self._get_trunk_orientation()
-                    nearest_idx, dist_to_path, _, _ = self.episode_path.nearest(pos[:2])
-                except Exception:
-                    terminated = True
-                    break
-            else:
-                base_z = 0.25
-                roll, pitch = 0.0, 0.0
-                dist_to_path = 0.0
-                nearest_idx = 0
+            # Exact path-following reference trajectory steering (Section III-A)
+            # Combines Pure Pursuit lookahead, Stanley cross-track error correction,
+            # omnidirectional lateral crabbing, and turn-adaptive forward speed scaling
+            if self.episode_path is not None and len(self.episode_path.points) > 0:
+                pos = self._sim_pos if self.dry_run else (
+                    p.getBasePositionAndOrientation(self.robot_id)[0] if (p and self.robot_id) else [0.0, 0.0, 0.28]
+                )
+                nearest_idx, distance, lat_offset, tangent = self.episode_path.nearest(pos[:2])
+                pts = self.episode_path.points
+                total_pts = len(pts)
 
-            fallen = bool(base_z < 0.10 or abs(roll) > 0.95 or abs(pitch) > 0.95)
-            far_from_path = bool(dist_to_path > 1.80)
-            reached_end = bool(nearest_idx >= len(self.episode_path.points) - 2)
+                # Lookahead waypoint on spline (~0.12m ahead: tightly follows curves)
+                lookahead_idx = min(nearest_idx + 14, total_pts - 1)
+                target_pt = pts[lookahead_idx]
+                target_vec = target_pt - pos[:2]
+                target_dist = float(np.linalg.norm(target_vec))
 
-            if fallen or far_from_path:
-                terminated = True
-                break
-            if reached_end:
-                truncated = True
-                break
+                # Ensure target vector always points along path travel direction (never backwards)
+                if target_dist > 1e-4 and float(np.dot(target_vec, tangent)) > 0.0:
+                    target_yaw = math.atan2(target_vec[1], target_vec[0])
+                else:
+                    target_yaw = math.atan2(tangent[1], tangent[0])
 
-            # Human GUI camera track
-            if self.render_mode == "human" and p is not None and self.robot_id is not None and substep % 4 == 0:
-                pos, _ = p.getBasePositionAndOrientation(self.robot_id)
-                p.resetDebugVisualizerCamera(
-                    cameraDistance=1.5,
-                    cameraYaw=30.0,
-                    cameraPitch=-30.0,
-                    cameraTargetPosition=pos,
+                trunk_yaw = float(self._sim_rpy[2]) if self.dry_run else self._get_trunk_orientation()[2]
+                yaw_err = math.atan2(math.sin(target_yaw - trunk_yaw), math.cos(target_yaw - trunk_yaw))
+
+                # Stanley cross-track error steering term:
+                # lat_offset > 0 (robot right of path) -> steer left (+turn)
+                # lat_offset < 0 (robot left of path) -> steer right (-turn)
+                cross_yaw = math.atan2(3.0 * lat_offset, 0.30)
+                turn_cmd = float(np.clip(1.5 * yaw_err + 1.2 * cross_yaw, -0.70, 0.70))
+
+                # Dynamic forward speed scaling: decelerate on sharp turns to maintain tight turning radius
+                turn_severity = abs(yaw_err)
+                speed_scale = max(0.55, math.cos(min(turn_severity, math.pi / 2)))
+                length_x = float(0.082 * speed_scale)
+
+                # Omnidirectional quadruped lateral crabbing: directly eliminates lateral offset
+                lat_stride = float(np.clip(0.35 * lat_offset, -0.024, 0.024))
+
+                self.gait.cmd = CycleCommand.differential(
+                    length_x=length_x,
+                    length_y=lat_stride,
+                    turn=turn_cmd,
+                    height=0.14,
+                    stance_z=-0.22,
+                    stance_width=0.035,
+                    swing_frac=0.18,
+                    cycle_time=0.76,
                 )
 
-        obs_dict = self._get_obs()
-        obs = self._format_obs(obs_dict)
+            for substep in range(n_substeps):
+                last_substep = substep
 
-        if self.episode_step_count >= self.max_episode_steps:
-            truncated = True
+                # Obstacle-aware swing start: read actual foot positions in hip frames
+                actual_foot_pos = None
+                trunk_roll = 0.0
+                trunk_pitch = 0.0
+                if not self.dry_run and p is not None and self.robot_id is not None and len(self.foot_link_indices) == 4:
+                    try:
+                        base_pos, base_quat = p.getBasePositionAndOrientation(self.robot_id)
+                        inv_b_pos, inv_b_quat = p.invertTransform(base_pos, base_quat)
+                        actual_foot_pos = {}
+                        for leg, foot_idx in zip(("FR", "FL", "RR", "RL"), self.foot_link_indices):
+                            f_state = p.getLinkState(self.robot_id, foot_idx)
+                            f_trunk, _ = p.multiplyTransforms(inv_b_pos, inv_b_quat, f_state[0], [0, 0, 0, 1])
+                            r_hip = A1_HIP_OFFSETS[leg]
+                            actual_foot_pos[leg] = (f_trunk[0] - r_hip[0], f_trunk[1] - r_hip[1], f_trunk[2] - r_hip[2])
+                        trunk_roll, trunk_pitch, _ = self._get_trunk_orientation()
+                    except Exception:
+                        actual_foot_pos = None
 
-        end_progress_idx = int(self._current_info_metrics["path_index"])
-        total_pts = max(len(self.episode_path.points) - 1, 1)
-        cycle_progress = max(0, end_progress_idx - start_progress_idx) / total_pts
-        self._last_progress_index = end_progress_idx
+                # Update nominal reference crawl gait with terrain-aware swing liftoff
+                self.gait.update(dt_sub, actual_foot_pos=actual_foot_pos)
 
-        reward, reward_components = self._compute_cycle_reward(
-            action=action,
-            obs_dict=obs_dict,
-            cycle_progress=cycle_progress,
-            terminated=terminated,
-            dt_cycle=cmd.cycle_time,
-        )
+                # Active attitude leveling feedback (keeps trunk horizontal on uneven pyramid facets)
+                roll_level = float(np.clip(0.12 * trunk_roll, -0.025, 0.025))
+                pitch_level = float(np.clip(0.10 * trunk_pitch, -0.025, 0.025))
 
+                # Compute corrected hip-relative foot targets and map via IK
+                targets_ordered = []
+                for leg in ("FR", "FL", "RR", "RL"):
+                    p_ref = np.array(self.gait.foot_targets[leg], dtype=np.float32)
+                    r_hip = A1_HIP_OFFSETS[leg]
+
+                    # Rotational displacement: delta_O_base x r_hip
+                    delta_rot = np.array([
+                        -delta_O_base[2] * r_hip[1],
+                         delta_O_base[2] * r_hip[0],
+                         delta_O_base[0] * r_hip[1] - delta_O_base[1] * r_hip[0],
+                    ], dtype=np.float32)
+
+                    # Dynamic attitude leveling offset per leg
+                    side_sign = float(SIDE[leg])  # +1 for FL/RL, -1 for FR/RR
+                    fore_sign = 1.0 if leg.startswith("F") else -1.0  # +1 for FR/FL, -1 for RR/RL
+                    z_level = side_sign * roll_level + fore_sign * pitch_level
+
+                    # Corrected foot position relative to hip
+                    p_corr = p_ref + delta_P_feet[leg] - delta_P_base - delta_rot
+                    p_corr[2] += z_level
+
+                    # Inverse Kinematics
+                    q_leg = foot_to_joints(leg, float(p_corr[0]), float(p_corr[1]), float(p_corr[2]))
+                    targets_ordered.extend(q_leg)
+
+                target_positions = np.clip(targets_ordered, JOINT_LOWER_LIMITS, JOINT_UPPER_LIMITS)
+
+                if self.dry_run:
+                    self._sim_joints = target_positions.astype(np.float32).copy()
+                    if self.episode_path is not None:
+                        _, _, _, tangent = self.episode_path.nearest(self._sim_pos[:2])
+                        motion_speed = 0.06 / 1.0  # nominal crawl speed ~0.06 m/s
+                        self._sim_pos[:2] += tangent * (motion_speed * dt_ctrl)
+                        self._sim_vel[:2] = tangent * motion_speed
+                elif p is not None and self.robot_id is not None:
+                    for j_idx, target_q in zip(self.joint_indices, target_positions):
+                        p.setJointMotorControl2(
+                            self.robot_id,
+                            j_idx,
+                            p.POSITION_CONTROL,
+                            targetPosition=float(target_q),
+                            force=MAX_MOTOR_FORCE,
+                        )
+                    for _ in range(self.action_repeat):
+                        p.stepSimulation()
+                    if self.render_mode == "human":
+                        import time
+                        time.sleep(dt_ctrl)
+
+                # Substep termination check
+                if self.dry_run:
+                    base_z = float(self._sim_pos[2])
+                    roll, pitch = float(self._sim_rpy[0]), float(self._sim_rpy[1])
+                    nearest_idx, dist_to_path, _, _ = self.episode_path.nearest(self._sim_pos[:2])
+                elif p is not None and self.robot_id is not None:
+                    try:
+                        pos, _ = p.getBasePositionAndOrientation(self.robot_id)
+                        base_z = float(pos[2])
+                        roll, pitch, _ = self._get_trunk_orientation()
+                        nearest_idx, dist_to_path, _, _ = self.episode_path.nearest(pos[:2])
+                    except Exception:
+                        terminated = True
+                        break
+                else:
+                    base_z = 0.25
+                    roll, pitch = 0.0, 0.0
+                    dist_to_path = 0.0
+                    nearest_idx = 0
+
+                fallen = bool(base_z < 0.08 or abs(roll) > 1.15 or abs(pitch) > 1.15)
+                far_from_path = bool(dist_to_path > 1.80)
+                reached_end = bool(
+                    nearest_idx >= len(self.episode_path.points) - 2
+                    or (pos is not None and float(np.linalg.norm(pos[:2] - self.episode_path.points[-1][:2])) < 0.10)
+                )
+
+                if fallen or far_from_path:
+                    terminated = True
+                    break
+                if reached_end:
+                    truncated = True
+                    break
+
+                # Camera track in GUI mode
+                if self.render_mode == "human" and p is not None and self.robot_id is not None and substep % 4 == 0:
+                    pos, _ = p.getBasePositionAndOrientation(self.robot_id)
+                    p.resetDebugVisualizerCamera(
+                        cameraDistance=1.5,
+                        cameraYaw=30.0,
+                        cameraPitch=-30.0,
+                        cameraTargetPosition=pos,
+                    )
+
+            obs_dict = self._get_obs()
+            obs = self._format_obs(obs_dict)
+
+            if self.episode_step_count >= self.max_episode_steps:
+                truncated = True
+
+            end_progress_idx = int(self._current_info_metrics["path_index"])
+            total_pts = max(len(self.episode_path.points) - 1, 1)
+            step_progress = max(0, end_progress_idx - start_progress_idx) / total_pts
+            self._last_progress_index = end_progress_idx
+
+            reward, reward_components = self._compute_paper_reward(
+                action=action,
+                obs_dict=obs_dict,
+                joint_positions=obs_dict["joint_positions"],
+                joint_velocities=obs_dict["joint_velocities"],
+                foot_velocities=obs_dict["foot_velocities"],
+                progress=step_progress,
+                terminated=terminated,
+                dt_step=dt_step,
+            )
+
+        else:
+            # ------------------------------------------------------------------
+            # High-level Gait Cycle parameterization mode
+            # ------------------------------------------------------------------
+            cmd = action_to_cycle_command(action)
+            self.gait.cmd = cmd
+
+            n_substeps = max(1, int(round(cmd.cycle_time / dt_ctrl)))
+            dt_gait = cmd.cycle_time / float(n_substeps)
+
+            for substep in range(n_substeps):
+                last_substep = substep
+                joint_targets = self.gait.update(dt_gait)
+                targets_ordered = []
+                for leg in ("FR", "FL", "RR", "RL"):
+                    targets_ordered.extend(joint_targets[leg])
+                target_positions = np.clip(targets_ordered, JOINT_LOWER_LIMITS, JOINT_UPPER_LIMITS)
+
+                if self.dry_run:
+                    self._sim_joints = target_positions.astype(np.float32).copy()
+                    if self.episode_path is not None:
+                        _, _, _, tangent = self.episode_path.nearest(self._sim_pos[:2])
+                        mean_length_x = float(np.mean([cmd.legs[n].length_x for n in LEG_NAMES]))
+                        motion_speed = mean_length_x / cmd.cycle_time if cmd.cycle_time > 0 else 0.0
+                        self._sim_pos[:2] += tangent * (motion_speed * dt_ctrl)
+                        self._sim_vel[:2] = tangent * motion_speed
+                elif p is not None and self.robot_id is not None:
+                    for j_idx, target_q in zip(self.joint_indices, target_positions):
+                        p.setJointMotorControl2(
+                            self.robot_id,
+                            j_idx,
+                            p.POSITION_CONTROL,
+                            targetPosition=float(target_q),
+                            force=MAX_MOTOR_FORCE,
+                        )
+                    for _ in range(self.action_repeat):
+                        p.stepSimulation()
+                    if self.render_mode == "human":
+                        import time
+                        time.sleep(dt_ctrl)
+
+                # Substep termination check
+                if self.dry_run:
+                    base_z = float(self._sim_pos[2])
+                    roll, pitch = float(self._sim_rpy[0]), float(self._sim_rpy[1])
+                    nearest_idx, dist_to_path, _, _ = self.episode_path.nearest(self._sim_pos[:2])
+                elif p is not None and self.robot_id is not None:
+                    try:
+                        pos, _ = p.getBasePositionAndOrientation(self.robot_id)
+                        base_z = float(pos[2])
+                        roll, pitch, _ = self._get_trunk_orientation()
+                        nearest_idx, dist_to_path, _, _ = self.episode_path.nearest(pos[:2])
+                    except Exception:
+                        terminated = True
+                        break
+                else:
+                    base_z = 0.25
+                    roll, pitch = 0.0, 0.0
+                    dist_to_path = 0.0
+                    nearest_idx = 0
+
+                fallen = bool(base_z < 0.08 or abs(roll) > 1.15 or abs(pitch) > 1.15)
+                far_from_path = bool(dist_to_path > 1.80)
+                reached_end = bool(nearest_idx >= len(self.episode_path.points) - 5)
+
+                if fallen or far_from_path:
+                    terminated = True
+                    break
+                if reached_end:
+                    truncated = True
+                    break
+
+                if self.render_mode == "human" and p is not None and self.robot_id is not None and substep % 4 == 0:
+                    pos, _ = p.getBasePositionAndOrientation(self.robot_id)
+                    p.resetDebugVisualizerCamera(
+                        cameraDistance=1.5,
+                        cameraYaw=30.0,
+                        cameraPitch=-30.0,
+                        cameraTargetPosition=pos,
+                    )
+
+            obs_dict = self._get_obs()
+            obs = self._format_obs(obs_dict)
+
+            if self.episode_step_count >= self.max_episode_steps:
+                truncated = True
+
+            end_progress_idx = int(self._current_info_metrics["path_index"])
+            total_pts = max(len(self.episode_path.points) - 1, 1)
+            cycle_progress = max(0, end_progress_idx - start_progress_idx) / total_pts
+            self._last_progress_index = end_progress_idx
+
+            reward, reward_components = self._compute_cycle_reward(
+                action=action,
+                obs_dict=obs_dict,
+                cycle_progress=cycle_progress,
+                terminated=terminated,
+                dt_cycle=cmd.cycle_time,
+            )
+
+        # Update previous temporal states
         self._previous_action = action.copy()
+        self._previous_joint_positions = obs_dict["joint_positions"].copy()
+        self._previous_joint_velocities = obs_dict["joint_velocities"].copy()
+        self._previous_foot_velocities = obs_dict["foot_velocities"].copy()
 
         info = {
             "step_count": int(self.episode_step_count),
+            "action_mode": str(self.action_mode),
             "fallen": bool(fallen),
             "far_from_path": bool(far_from_path),
             "reached_end": bool(reached_end),
-            "cycle_time": float(cmd.cycle_time),
-            "cycle_progress": float(cycle_progress),
             "substeps_executed": int(last_substep + 1),
             "reward_components": dict(reward_components),
             "path_index": int(self._current_info_metrics["path_index"]),
