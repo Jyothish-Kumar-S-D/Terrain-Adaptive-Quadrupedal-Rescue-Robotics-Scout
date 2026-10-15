@@ -6,3 +6,7 @@ __pycache__/
 
 # Generated simulation videos
 videos/
+
+# Generated simulation outputs
+videos/
+point_clouds/
