@@ -21,6 +21,8 @@ from Inverse_Kinematics.IK_A1 import (
 from point_cloud import PointCloudAccumulator, PointCloudViewer, depth_to_point_cloud
 from deep_rl import DepthPPOController, depth_observation
 from deep_rl.depth_dataset import DepthFrameStore
+from path_training import PathTaskConfig, PathTrainingTask
+from surrounding_building.terrain_building import RandomTerrainConfig
 
 
 DT = 1.0 / 120.0
@@ -31,14 +33,6 @@ CG_X = -0.085
 PROJECT_DIR = Path(__file__).resolve().parent
 DEPTH_FRAME_DIR = PROJECT_DIR / "depth_frames"
 PPO_MODEL_PATH = PROJECT_DIR / "models" / "a1_depth_ppo"
-
-# Alternating waypoints steer the robot around the large blocks.
-PATH = (
-    (0.0, 0.0), (0.8, 0.0), (1.5, 1.0), (2.6, 1.0),
-    (3.2, -1.0), (4.2, -1.0), (4.8, 1.0), (5.8, 1.0),
-    (6.4, 0.0), (7.2, 0.0),
-)
-
 
 def add_arch(position, opening=1.05, height=1.5, depth=0.65, thickness=0.28,
              color=(0.82, 0.22, 0.12, 1)):
@@ -76,11 +70,14 @@ def add_arch(position, opening=1.05, height=1.5, depth=0.65, thickness=0.28,
     )
 
 
-def draw_path():
-    for start, end in zip(PATH, PATH[1:]):
+def draw_path(path):
+    points = path.points
+    # Debug drawing every few samples keeps a smooth-looking route without
+    # creating hundreds of line segments in the GUI.
+    for start, end in zip(points[::8], points[8::8]):
         p.addUserDebugLine(
-            [start[0], start[1], 0.035],
-            [end[0], end[1], 0.035],
+            [float(start[0]), float(start[1]), 0.035],
+            [float(end[0]), float(end[1]), 0.035],
             lineColorRGB=[0.1, 0.95, 0.25],
             lineWidth=5,
             lifeTime=0,
@@ -124,10 +121,11 @@ def stand_up(robot_id, joints):
         time.sleep(DT)
 
 
-def path_command(robot_id, path_index):
-    """Choose a differential crawl command toward the next route waypoint."""
+def path_command(robot_id, path, path_index):
+    """Choose a differential crawl command toward a look-ahead route point."""
     position, orientation = p.getBasePositionAndOrientation(robot_id)
-    if path_index == len(PATH) - 1 and math.dist(position[:2], PATH[-1]) < 0.65:
+    points = path.points
+    if path_index == len(points) - 1 and math.dist(position[:2], points[-1]) < 0.45:
         return CycleCommand.uniform(
             length_x=0.0,
             height=0.02,
@@ -135,7 +133,8 @@ def path_command(robot_id, path_index):
             cg_offset_x=CG_X,
         )
     yaw = p.getEulerFromQuaternion(orientation)[2]
-    target = PATH[path_index]
+    # Aim ahead on the sampled curve so bends are followed smoothly.
+    target = points[min(path_index + 12, len(points) - 1)]
     dx, dy = target[0] - position[0], target[1] - position[1]
     heading_error = math.atan2(dy, dx) - yaw
     heading_error = (heading_error + math.pi) % (2 * math.pi) - math.pi
@@ -178,23 +177,13 @@ def policy_state(robot_id):
     ], dtype=np.float32)
 
 
-def reached_or_passed(position, waypoint_index):
-    """Avoid getting stuck when momentum carries the robot past a waypoint."""
-    target = PATH[waypoint_index]
-    if math.dist(position[:2], target) < 0.55:
-        return True
-
-    start = PATH[waypoint_index - 1]
-    segment_x = target[0] - start[0]
-    segment_y = target[1] - start[1]
-    segment_length = math.hypot(segment_x, segment_y)
-    if segment_length == 0:
-        return False
-    relative_x = position[0] - start[0]
-    relative_y = position[1] - start[1]
-    along = (relative_x * segment_x + relative_y * segment_y) / segment_length
-    cross_track = abs(relative_x * segment_y - relative_y * segment_x) / segment_length
-    return along >= segment_length and cross_track < 0.8
+def reached_or_passed(position, path, waypoint_index):
+    """Move the route tracker forward to the nearest nearby sample."""
+    points = path.points
+    search_end = min(waypoint_index + 32, len(points))
+    delta = points[waypoint_index:search_end] - np.asarray(position[:2])
+    nearest = waypoint_index + int(np.argmin(np.einsum("ij,ij->i", delta, delta)))
+    return max(waypoint_index, nearest)
 
 
 def main():
@@ -207,12 +196,25 @@ def main():
         p.setGravity(0, 0, -9.81)
         p.setTimeStep(DT)
         p.loadURDF("plane.urdf")
-        # Collidable arches stand ahead along the route; each is one visual
-        # object, so its complete point-cloud scan receives one color.
-        add_arch((2.0, 0.0), color=(0.82, 0.22, 0.12, 1))
-        add_arch((3.7, 0.7), color=(0.18, 0.42, 0.88, 1))
-        add_arch((5.3, -0.7), color=(0.92, 0.58, 0.12, 1))
-        draw_path()
+        # A fresh route and obstacle field are sampled on every launch.
+        # Extend terrain ahead of the full route while keeping the start clear.
+        task = PathTrainingTask(PathTaskConfig(
+            path_length=7.2,
+            path_width=2.4,
+            waypoint_count=10,
+            path_samples=360,
+            terrain=RandomTerrainConfig(
+                extent=9.0,
+                spacing=0.34,
+                size=(0.24, 0.52),
+                height=(0.04, 0.22),
+                density=0.82,
+                jitter=0.10,
+                clear_radius=0.75,
+            ),
+        ))
+        route = task.reset_episode(load_terrain=True)
+        draw_path(route)
         robot_id = p.loadURDF(
             "urdf/a1_unitree.urdf",
             basePosition=[0, 0, 0.12],
@@ -232,7 +234,7 @@ def main():
         stand_up(robot_id, joints)
 
         waypoint = 1
-        fallback_gait = lambda: path_command(robot_id, waypoint)
+        fallback_gait = lambda: path_command(robot_id, route, waypoint)
         controller = DepthPPOController(PPO_MODEL_PATH)
         policy_loaded = False
         try:
@@ -257,9 +259,10 @@ def main():
         while p.isConnected(client):
             # Advance the look-ahead waypoint once the robot reaches it.
             position = p.getBasePositionAndOrientation(robot_id)[0]
-            while waypoint < len(PATH) - 1 and reached_or_passed(position, waypoint):
-                waypoint += 1
-                gait.set_next_cycle(path_command(robot_id, waypoint))
+            next_waypoint = reached_or_passed(position, route, waypoint)
+            if next_waypoint > waypoint:
+                waypoint = next_waypoint
+                gait.set_next_cycle(path_command(robot_id, route, waypoint))
             if (
                 policy_loaded
                 and latest_depth is not None
