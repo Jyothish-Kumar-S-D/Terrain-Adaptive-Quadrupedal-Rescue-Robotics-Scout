@@ -11,7 +11,7 @@ import numpy as np
 
 DEPTH_WIDTH = 64
 DEPTH_HEIGHT = 48
-STATE_SIZE = 11
+STATE_SIZE = 15
 OBSERVATION_SIZE = DEPTH_WIDTH * DEPTH_HEIGHT + STATE_SIZE
 
 
@@ -78,13 +78,45 @@ class DepthPPOController:
         dt = 1.0 / 120.0
         z_stand, z_down, cg_x = -0.22, -0.10, -0.085
 
+        def add_training_arch(x, y, opening=0.9, height=0.75,
+                             depth=0.35, thickness=0.16):
+            """Add a low collidable gate centered on the episode route."""
+            pillar_half = [depth / 2, thickness / 2, height / 2]
+            beam_half = [depth / 2, (opening + 2 * thickness) / 2,
+                         thickness / 2]
+            pillar_y = opening / 2 + thickness / 2
+            collision = p.createCollisionShapeArray(
+                shapeTypes=[p.GEOM_BOX] * 3,
+                halfExtents=[pillar_half, pillar_half, beam_half],
+                collisionFramePositions=[
+                    [0, -pillar_y, height / 2],
+                    [0, pillar_y, height / 2],
+                    [0, 0, height],
+                ],
+            )
+            visual = p.createVisualShapeArray(
+                shapeTypes=[p.GEOM_BOX] * 3,
+                halfExtents=[pillar_half, pillar_half, beam_half],
+                visualFramePositions=[
+                    [0, -pillar_y, height / 2],
+                    [0, pillar_y, height / 2],
+                    [0, 0, height],
+                ],
+                rgbaColors=[[0.82, 0.22, 0.12, 1.0]] * 3,
+            )
+            return p.createMultiBody(
+                baseMass=0, baseCollisionShapeIndex=collision,
+                baseVisualShapeIndex=visual, basePosition=[x, y, 0],
+            )
+
         class PolicySpace(gym.Env):
             metadata = {"render_modes": []}
 
             def __init__(self):
                 super().__init__()
                 self.observation_space = spaces.Box(
-                    low=0.0, high=1.0, shape=(OBSERVATION_SIZE,), dtype=np.float32,
+                    low=-np.inf, high=np.inf, shape=(OBSERVATION_SIZE,),
+                    dtype=np.float32,
                 )
                 self.action_space = spaces.Box(
                     low=-1.0, high=1.0, shape=(4,), dtype=np.float32,
@@ -96,9 +128,12 @@ class DepthPPOController:
                 p.setTimeStep(dt)
                 p.setGravity(0, 0, -9.81)
                 self.task = PathTrainingTask(
-                    PathTaskConfig(path_length=2.5, path_width=0.8,
-                                   waypoint_count=5, depth_width=DEPTH_WIDTH,
-                                   depth_height=DEPTH_HEIGHT), seed=seed,
+                    PathTaskConfig(
+                        path_length=4.0, path_width=1.2,
+                        waypoint_count=7, path_samples=280,
+                        depth_width=DEPTH_WIDTH, depth_height=DEPTH_HEIGHT,
+                        path_tolerance=0.25,
+                    ), seed=seed,
                 )
                 self.robot = None
                 self.camera = None
@@ -115,7 +150,13 @@ class DepthPPOController:
                 p.setGravity(0, 0, -9.81)
                 p.setTimeStep(dt)
                 p.loadURDF("plane.urdf")
-                self.task.reset_episode(seed=seed, load_terrain=True)
+                route = self.task.reset_episode(seed=seed, load_terrain=True)
+                # Put gates at distinct points along the randomized path so
+                # each rollout learns route following with arch obstacles.
+                for fraction in (0.28, 0.56, 0.82):
+                    gate_index = int(fraction * (len(route.points) - 1))
+                    gate_x, gate_y = route.points[gate_index]
+                    add_training_arch(float(gate_x), float(gate_y))
                 self.robot = p.loadURDF(
                     str(Path(__file__).resolve().parents[1] / "urdf" / "a1_unitree.urdf"),
                     [0, 0, 0.12], useFixedBase=False,
@@ -203,6 +244,10 @@ class DepthPPOController:
                     *np.clip(np.asarray(linear) / 2.0, -1.0, 1.0),
                     *np.clip(np.asarray(angular) / 4.0, -1.0, 1.0),
                     float(pos[2]) / 0.5,
+                    float(task_observation["path_tangent"][0]),
+                    float(task_observation["path_tangent"][1]),
+                    float(np.clip(task_observation["path_offset"] / 2.0, -1.0, 1.0)),
+                    float(np.clip(task_observation["path_distance"] / 2.0, 0.0, 1.0)),
                 ], dtype=np.float32)
                 vector = depth_observation(task_observation["depth"], state)
                 return task_observation, vector
@@ -220,7 +265,14 @@ class DepthPPOController:
             path = Path(str(path) + ".zip")
         if not path.exists():
             return False
-        self.model = ppo.load(str(path.with_suffix("")))
+        model = ppo.load(str(path.with_suffix("")))
+        model_shape = tuple(model.observation_space.shape)
+        if model_shape != (OBSERVATION_SIZE,):
+            raise RuntimeError(
+                f"Checkpoint expects observations {model_shape}; this route-aware "
+                f"environment uses {(OBSERVATION_SIZE,)}. Retrain the policy."
+            )
+        self.model = model
         return True
 
     def train(self, total_timesteps=100_000):
