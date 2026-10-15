@@ -7,9 +7,10 @@ including for commercial purposes, provided this notice is retained.
 This code is provided "as is", without warranty or liability.
 '''
 
-import numpy as np
-import pybullet as p
-import cv2
+try:
+    import pybullet as p
+except ImportError:
+    p = None
 
 
 class DepthCamera:

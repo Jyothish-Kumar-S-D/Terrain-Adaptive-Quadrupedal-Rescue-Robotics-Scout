@@ -1,15 +1,18 @@
+from __future__ import annotations
+
 import math
 import random
 from dataclasses import dataclass, field, replace
-from typing import Iterator, List, Optional, Sequence, Tuple
-
-import pybullet as p
+from typing import List, Optional, Sequence, Tuple
+try:
+    import pybullet as p
+except ImportError:
+    p = None
 
 
 def create_pyramid(position, size=1.5, height=0.5, color=[0.8, 0.3, 0.1, 1.0],
                    lateral_friction=1.5, spinning_friction=0.3, rolling_friction=0.3):
     half = size / 2.0
-
     vertices = [
         (-half, -half, 0.0),
         ( half, -half, 0.0),
