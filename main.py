@@ -294,8 +294,8 @@ def main():
         ))
         route = task.reset_episode(load_terrain=True)
         draw_path(route)
-        # Add gates along the path for visual guidance, aligned with path tangent.
-        for fraction in (0.2, 0.4, 0.6, 0.8):
+        # Add 2 gates along the path for visual guidance, aligned with path tangent.
+        for fraction in (0.33, 0.66):
             gate_index = int(fraction * (len(route.points) - 1))
             gate_x, gate_y = route.points[gate_index]
             # Get tangent at gate position to align arch with path direction.
@@ -403,6 +403,15 @@ def main():
             time.sleep(DT)
 
         video_recorder.close()
+        print("Simulation ended. Generating final point cloud...")
+
+        # Capture final depth frame for point cloud
+        depth, segmentation = camera.capture_frame()
+        points, colors = depth_to_point_cloud(
+            depth, camera, stride=4, segmentation=segmentation,
+        )
+        cloud.add(points, colors)
+
         final_points = cloud.points()
         final_colors = cloud.colors()
         if len(final_points) > 2000:
