@@ -27,6 +27,7 @@ class DepthCamera:
         self.robot_id = robot_id
         self.width = width
         self.height = height
+        self.fov = fov
         self.near = near
         self.far = far
 
@@ -90,6 +91,11 @@ class DepthCamera:
         )
 
     def capture(self):
+        depth, _ = self.capture_frame()
+        return depth
+
+    def capture_frame(self):
+        """Return metric depth and the PyBullet object segmentation mask."""
         view_matrix = self._get_view_matrix()
 
         image = p.getCameraImage(
@@ -119,7 +125,12 @@ class DepthCamera:
             )
         )
 
-        return depth
+        segmentation = np.asarray(
+            image[4],
+            dtype=np.int32,
+        ).reshape(self.height, self.width)
+
+        return depth, segmentation
 
     def show(self, depth):
         display = np.clip(

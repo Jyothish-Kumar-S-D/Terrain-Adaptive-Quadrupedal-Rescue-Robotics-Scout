@@ -4,3 +4,5 @@ scipy
 matplotlib
 gymnasium
 opencv-python
+stable-baselines3>=2.3.2,<3
+torch>=2.2
