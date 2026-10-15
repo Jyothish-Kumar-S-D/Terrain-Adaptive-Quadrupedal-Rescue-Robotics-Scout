@@ -1,6 +1,8 @@
 """Build and display a 3D point cloud from the robot's depth camera."""
 
 import numpy as np
+import json
+from pathlib import Path
 
 OBJECT_PALETTE = np.asarray([
     (0.55, 0.58, 0.62),  # ground
@@ -48,6 +50,30 @@ class PointCloudAccumulator:
         if not self._points:
             return np.empty((0, 3), dtype=np.float32)
         return np.asarray(list(self._points.values()), dtype=np.float32)
+
+    def save(self, filepath):
+        """Save accumulated point cloud to disk (NPZ format)."""
+        filepath = Path(filepath)
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+        points = self.points()
+        colors = self.colors()
+        np.savez_compressed(filepath, points=points, colors=colors)
+        print(f"Point cloud saved: {filepath} ({len(points)} points)")
+
+    @classmethod
+    def load(cls, filepath):
+        """Load point cloud from disk, return new PointCloudAccumulator."""
+        filepath = Path(filepath)
+        data = np.load(filepath)
+        points = data['points']
+        colors = data['colors']
+        accumulator = cls()
+        if len(points) > 0:
+            rounded = np.round(points, decimals=4)
+            for point, color in zip(rounded, colors):
+                accumulator._points.setdefault(tuple(point.tolist()), tuple(color.tolist()))
+        print(f"Point cloud loaded: {filepath} ({len(accumulator._points)} points)")
+        return accumulator
 
 
 def depth_to_point_cloud(depth, camera, stride=8, max_depth=None, segmentation=None):
