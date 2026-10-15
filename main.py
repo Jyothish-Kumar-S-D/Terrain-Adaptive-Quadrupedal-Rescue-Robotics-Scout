@@ -294,8 +294,8 @@ def main():
         ))
         route = task.reset_episode(load_terrain=True)
         draw_path(route)
-        # Add gates along the path for visual guidance, aligned with path tangent.
-        for fraction in (0.2, 0.4, 0.6, 0.8):
+        # Add 2 gates along the path for visual guidance, aligned with path tangent.
+        for fraction in (0.33, 0.66):
             gate_index = int(fraction * (len(route.points) - 1))
             gate_x, gate_y = route.points[gate_index]
             # Get tangent at gate position to align arch with path direction.
@@ -350,8 +350,10 @@ def main():
         policy_update_interval = 0.1
         latest_depth = None
         policy_action = None
-        print("PyBullet GUI is running. Close its window or press Ctrl+C to stop.")
-        while p.isConnected(client):
+        max_steps = 500
+        step_count = 0
+        print("PyBullet GUI is running. Running for 500 steps...")
+        while p.isConnected(client) and step_count < max_steps:
             # Advance the look-ahead waypoint once the robot reaches it.
             position = p.getBasePositionAndOrientation(robot_id)[0]
             next_waypoint = reached_or_passed(position, route, waypoint)
@@ -401,8 +403,18 @@ def main():
                 cloud.add(points, colors)
                 last_cloud_update = now
             time.sleep(DT)
+            step_count += 1
 
         video_recorder.close()
+        print(f"Simulation complete after {step_count} steps. Generating point cloud...")
+
+        # Capture final depth frame for point cloud
+        depth, segmentation = camera.capture_frame()
+        points, colors = depth_to_point_cloud(
+            depth, camera, stride=4, segmentation=segmentation,
+        )
+        cloud.add(points, colors)
+
         final_points = cloud.points()
         final_colors = cloud.colors()
         if len(final_points) > 2000:
