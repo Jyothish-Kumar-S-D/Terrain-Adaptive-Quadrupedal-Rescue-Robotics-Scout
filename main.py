@@ -5,6 +5,8 @@ Run from the project root with ``venv/bin/python main.py``.
 
 import math
 import time
+import signal
+import sys
 from pathlib import Path
 
 import cv2
@@ -96,6 +98,9 @@ CG_X = -0.085
 PROJECT_DIR = Path(__file__).resolve().parent
 DEPTH_FRAME_DIR = PROJECT_DIR / "depth_frames"
 PPO_MODEL_PATH = PROJECT_DIR / "models" / "a1_depth_ppo.best"
+
+# Global for signal handler
+video_recorder_global = None
 
 def add_arch(position, opening=1.05, height=1.5, depth=0.65, thickness=0.28,
              color=(0.82, 0.22, 0.12, 1), yaw=0.0):
@@ -266,6 +271,24 @@ def reached_or_passed(position, path, waypoint_index):
 
 
 def main():
+    global video_recorder_global
+    video_recorder_global = None
+
+    def signal_handler(signum, frame):
+        print(f"\nReceived signal {signum}. Cleaning up...")
+        global video_recorder_global
+        if video_recorder_global is not None:
+            try:
+                video_recorder_global.close()
+            except Exception:
+                pass
+        if p.isConnected():
+            p.disconnect()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
     client = p.connect(p.GUI)
     if client < 0:
         raise RuntimeError("Could not open the PyBullet GUI")
@@ -338,12 +361,20 @@ def main():
         frame_store = DepthFrameStore(DEPTH_FRAME_DIR)
         cloud = PointCloudAccumulator()
 
+        # Point cloud save directory
+        cloud_dir = PROJECT_DIR / "point_clouds"
+        cloud_dir.mkdir(exist_ok=True)
+        cloud_path = cloud_dir / f"pointcloud_{time.strftime('%Y%m%d_%H%M%S')}.npz"
+        last_cloud_save = 0.0
+        cloud_save_interval = 30.0  # Save every 30 seconds
+
         # Video recorder for orbiting camera
         video_dir = PROJECT_DIR / "videos"
         video_dir.mkdir(exist_ok=True)
         video_path = video_dir / f"simulation_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
         video_recorder = VideoRecorder(video_path, width=1280, height=720, fps=30)
         video_recorder.start()
+        video_recorder_global = video_recorder
 
         last_cloud_update = 0.0
         last_policy_update = 0.0

@@ -1,122 +1,127 @@
 # Terrain-Adaptive Quadrupedal Rescue Robotics Scout
 
-Simulation and learning toolkit for a Unitree A1 quadruped navigating procedurally generated terrain. The project combines analytic leg inverse kinematics and crawl gait control with PyBullet simulation, depth-camera perception, point-cloud reconstruction, and an optional PPO policy for terrain-aware locomotion.
-
-<p align="center">
-  <strong>PyBullet simulation · Path following · Depth perception · Reinforcement learning</strong>
-</p>
-
-## Project highlights
-
-- Simulate a Unitree A1 robot with the included URDF and mesh assets.
-- Generate randomized terrain, smooth paths, and obstacle gates for navigation tasks.
-- Control the four-legged crawl gait with analytic inverse kinematics.
-- Capture metric depth images and reconstruct colored, world-frame point clouds.
-- Train a Stable-Baselines3 PPO policy using depth and robot-state observations.
-- Run path-following environments through the Gymnasium API.
+A reinforcement learning project for training a Unitree A1 quadruped robot to navigate complex terrains using depth camera observations and PPO.
 
 ## Requirements
 
-- Python **3.10** (recommended; the project includes a local `venv` configured for Python 3.10).
-- A desktop session with OpenGL support for the interactive PyBullet simulation.
-- PyTorch-compatible hardware for PPO training. A CUDA GPU is optional; CPU training is supported but can be slow.
+- Python 3.10
+- PyBullet
+- Stable-Baselines3
+- PyTorch
+- OpenCV
+- NumPy
+- Matplotlib
 
-Install the Python dependencies in a virtual environment:
-
+Install dependencies:
 ```bash
-python3.10 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+pip install -r requirements.txt
 ```
 
-On Windows, activate with `.venv\Scripts\activate`. If your system requires a specific PyTorch build, install the matching PyTorch package for your operating system and hardware before installing the remaining requirements.
+## Project Structure
 
-## Run the simulation
+```
+├── train_deep_rl.py      # Training script for PPO policy
+├── main.py               # Simulation with live GUI, video recording, point cloud
+├── scripts/
+│   └── view_pointcloud.py  # View saved point clouds
+├── deep_rl/              # RL controller and policy
+├── path_training/        # Path generation and rewards
+├── depth_processing/     # Depth camera processing
+├── point_cloud/          # Point cloud accumulation and viewing
+├── Inverse_Kinematics/   # A1 inverse kinematics
+├── surrounding_building/ # Terrain generation
+└── urdf/                 # A1 URDF model
+```
 
-From the repository root, with the virtual environment active:
+## Training
+
+Train the depth-based PPO policy:
+
+```bash
+# Basic training
+python train_deep_rl.py --timesteps 100000
+
+# With custom hyperparameters
+python train_deep_rl.py --timesteps 200000 --initial-lr 5e-4 --final-lr 1e-5 --n-steps 256 --batch-size 128
+```
+
+### Training Features
+- **Learning rate scheduling**: Exponential decay from initial to final LR
+- **Best model saving**: Saves model with highest composite score (reward + episode length - loss)
+- **Randomized paths**: Each episode gets a new random path with varied curvature
+- **Domain randomization**: Terrain, gates, and path vary per episode
+- **Reward shaping**: Path following, velocity alignment, stability, progress, fall penalty
+
+Output: `models/a1_depth_ppo.best.zip` (best model) and `models/a1_depth_ppo.zip` (final model)
+
+## Simulation
+
+Run the simulation with live GUI:
 
 ```bash
 python main.py
 ```
 
-The GUI simulation creates a randomized terrain course and path, places two gates along the route, and starts the A1 robot. It attempts to load `models/a1_depth_ppo.zip`; if no compatible checkpoint is available, it uses the analytic crawl gait. During the run it captures depth frames, accumulates a point cloud, and records an orbit-camera video under `videos/`. Close the PyBullet window or press `Ctrl+C` to stop; the accumulated point cloud is displayed after the simulation ends.
+### Simulation Features
+- **Live PyBullet GUI** with robot and terrain
+- **Orbiting camera video recording** (saved to `videos/simulation_*.mp4`)
+- **Periodic point cloud saving** (saved to `point_clouds/pointcloud_*.npz` every 5 seconds)
+- **Final point cloud display** on exit (interactive matplotlib 3D viewer)
+- **Graceful shutdown** on Ctrl+C or window close - saves video and point cloud
 
-The project has no separate headless option for `main.py`. For headless environment rollouts, use the training script or environment test commands below.
+### Keyboard Controls
+- `Ctrl+C` - Graceful shutdown with save
+- Close GUI window - Graceful shutdown with save
 
-## Train a depth PPO policy
+## Viewing Saved Point Clouds
 
-```bash
-python train_deep_rl.py --timesteps 100000
-```
-
-Training runs PyBullet in `DIRECT` mode and writes a Stable-Baselines3 checkpoint, normally `models/a1_depth_ppo.zip`. Useful options include:
-
-```bash
-python train_deep_rl.py --help
-python train_deep_rl.py --timesteps 250000 --seed 42 --model models/experiment
-```
-
-The policy receives a 64 × 48 depth image and a 15-value robot/path state vector. Its four normalized actions control stride length, turning, swing height, and gait cycle timing. Training can take substantial time, depending on hardware and the number of requested timesteps.
-
-## Run the path-following environment
-
-The Gymnasium environment is registered as `QuadrupedPathTerrain-v0` when `path_training` is imported. For example:
-
-```python
-import gymnasium as gym
-import path_training
-
-env = gym.make("QuadrupedPathTerrain-v0", render_mode=None)
-observation, info = env.reset(seed=42)
-```
-
-The environment can include depth observations and procedurally generated terrain. See `path_training/task.py` and `path_training/gym_env.py` for task configuration, observation, action, reward, and termination details.
-
-## Tests and demos
-
-The repository includes focused inverse-kinematics, gait, terrain-walking, and Gymnasium environment demos. Run them from the repository root:
+View previously saved point clouds:
 
 ```bash
-python tests/IK_module_test.py --help
-python tests/circle_wlk_test.py --help
-python tests/terrain_circle_walk_test.py --help
-python tests/test_path_terrain_env.py --help
+# View latest point cloud
+python scripts/view_pointcloud.py
+
+# View specific file
+python scripts/view_pointcloud.py point_clouds/pointcloud_20240101_120000.npz
+
+# List all saved clouds
+python scripts/view_pointcloud.py --list
 ```
 
-Example environment smoke run:
+## Key Components
 
-```bash
-python tests/test_path_terrain_env.py --policy nominal --episodes 1 --max-steps 50 --direct
-```
+### Reward Function (`path_training/task.py`)
+- Path adherence (Gaussian)
+- Path deviation penalty (linear + quadratic for far off-path)
+- Velocity alignment with path tangent
+- Stability (roll/pitch penalty)
+- Progress along path
+- Goal bonus
+- Fall penalty (-10.0, terminates episode)
+- Living penalty (-0.005/step)
 
-Gymnasium API check:
+### Environment (`deep_rl/controller.py`)
+- Depth + proprioceptive observations (64×48 depth + 15 state)
+- Custom CNN+MLP policy network
+- Fall detection: height < 0.12m OR roll/pitch > 0.7 rad (~40°)
+- Off-path termination with small positive reward
+- Randomized gates aligned with path tangent
 
-```bash
-python tests/test_path_terrain_env.py --check-env --direct
-```
+### Terrain (`surrounding_building/terrain_building.py`)
+- Small grippy pyramids (0.08-0.18m size, friction 1.5)
+- Covers full path + 2m margin
+- Spawn area kept flat
 
-## Repository layout
+## Output Directories
 
-| Path | Purpose |
-| --- | --- |
-| `main.py` | Interactive A1 simulation, path following, depth capture, point-cloud display, and video recording |
-| `train_deep_rl.py` | Command-line PPO training entry point |
-| `Inverse_Kinematics/` | Analytic leg inverse kinematics and crawl-gait generator |
-| `path_training/` | Path task generation and Gymnasium terrain environment |
-| `surrounding_building/` | Procedural terrain generation |
-| `depth_processing/` | PyBullet depth camera and metric depth conversion |
-| `point_cloud/` | Depth-to-point-cloud projection, accumulation, and visualization |
-| `deep_rl/` | PPO policy adapter and depth-frame storage |
-| `urdf/`, `meshes/` | Robot model and visual assets |
-| `models/` | Included or locally trained policy checkpoints |
-| `tests/` | Simulation demos and environment checks |
-| `Documentations/` | Inverse-kinematics module documentation |
+- `models/` - Trained PPO checkpoints
+- `videos/` - Simulation recordings (MP4)
+- `point_clouds/` - Accumulated point clouds (NPZ)
+- `depth_frames/` - Raw depth frames for dataset
 
-## Data and generated files
+## Notes
 
-Depth captures are written to `depth_frames/`; videos are written to `videos/`; PPO checkpoints are written to `models/`. These paths are ignored by Git, so generated data and newly trained models are not automatically included in commits. The repository currently includes `models/a1_depth_ppo.zip` as a checkpoint asset.
-
-## License
-
-The source file `depth_processing/Depth_Processing.py` contains a permissive copyright notice for that module. No repository-wide license file is currently present. Confirm the applicable license before redistributing or reusing the project as a whole.
+- SIGKILL (kill -9) cannot be caught - use Ctrl+C or window close for clean saves
+- Point clouds are saved periodically (every 5s) and on exit
+- Video recorder uses hardware OpenGL renderer for performance
+- Training uses PyBullet DIRECT mode (headless) for speed
