@@ -3,3 +3,6 @@ depth_frames/
 models/
 __pycache__/
 *.py[cod]
+
+# Generated simulation videos
+videos/

@@ -12,6 +12,8 @@ try:
 except ImportError:
     p = None
 
+import numpy as np
+
 
 class DepthCamera:
     def __init__(
