@@ -56,12 +56,18 @@ def parse_args():
 
     # Simulation & environment args
     parser.add_argument("--episodes", type=int, default=1, help="Number of test episodes")
-    parser.add_argument("--max-steps", type=int, default=50, help="Max gait cycles per episode")
+    parser.add_argument("--max-steps", type=int, default=1200, help="Max steps per episode (default: 1200 for full path traversal)")
+    parser.add_argument(
+        "--action-mode",
+        choices=["corrective", "gait_cycle"],
+        default="corrective",
+        help="Action mode: 'corrective' (18D paper task-space residual adaptation) or 'gait_cycle' (26D high-level cycle parameters)",
+    )
     parser.add_argument(
         "--policy",
-        choices=["nominal", "crawl", "random", "stand"],
+        choices=["nominal", "zero", "adaptive", "crawl", "random", "stand"],
         default="nominal",
-        help="Test action policy: 'nominal'/'crawl' (high-level crawl gait), 'random' (stochastic exploration), 'stand' (zero stride length)",
+        help="Test action policy: 'nominal'/'zero' (pure reference trajectory), 'adaptive' (heuristic terrain adaptation), 'random' (exploration)",
     )
     parser.add_argument("--direct", action="store_true", help="Headless mode (no PyBullet GUI window)")
     parser.add_argument("--check-env", action="store_true", help="Run Gymnasium API compliance checker")
@@ -104,22 +110,61 @@ def print_banner(text: str):
     print("=" * 95)
 
 
-def generate_test_action(policy_type: str, step_idx: int, action_space: gym.spaces.Box) -> np.ndarray:
-    """Generate normalized action in [-1.0, 1.0]^26 for the chosen policy."""
-    if policy_type in ("nominal", "crawl", "walk"):
-        # Nominal wave crawl gait parameters
-        return get_nominal_cycle_action()
-    elif policy_type == "stand":
-        # Stance without strides (zero length_x and length_y)
-        params = NOMINAL_ACTION_PARAMS.copy()
-        # Indices 13..20 are length_x and length_y
-        params[13:21] = 0.0
-        return normalize_action(params)
-    elif policy_type == "random":
-        # Stochastic exploration action uniformly sampled from action space
-        return action_space.sample()
+def generate_test_action(
+    policy_type: str,
+    step_idx: int,
+    action_space: gym.spaces.Box,
+    action_mode: str = "corrective",
+    obs: Optional[Dict[str, np.ndarray]] = None,
+) -> np.ndarray:
+    """Generate normalized action in [-1.0, 1.0] for the chosen policy and mode."""
+    if action_mode == "corrective":
+        if policy_type in ("nominal", "zero", "crawl", "stand", "walk"):
+            # Pure nominal trajectory tracking with zero task-space residual deviation
+            return np.zeros(action_space.shape, dtype=np.float32)
+        elif policy_type == "adaptive":
+            act = np.zeros(action_space.shape, dtype=np.float32)
+            if obs is not None and isinstance(obs, dict):
+                # 1. Base stabilization: counteract pitch and roll tilts
+                rpy = obs.get("trunk_orientation", np.zeros(3))
+                roll, pitch = float(rpy[0]), float(rpy[1])
+                act[3] = -float(np.clip(roll / 0.20, -0.6, 0.6))   # counter-roll
+                act[4] = -float(np.clip(pitch / 0.20, -0.6, 0.6))  # counter-pitch
+
+                # 2. Local elevation adaptation: if terrain ahead is high, elevate base
+                h_map = obs.get("height_map", np.zeros(36))
+                ahead_elev = float(np.mean(h_map[:18])) if len(h_map) >= 18 else 0.0
+                if ahead_elev > 0.005:
+                    act[2] = float(np.clip(ahead_elev / 0.04, 0.1, 0.5))  # delta_base_z
+
+                # 3. Foot swing clearances: lift legs that need clearance
+                contacts = obs.get("foot_contacts", np.ones(4))
+                for i, leg_z_idx in enumerate([8, 11, 14, 17]):
+                    if contacts[i] < 0.5:
+                        act[leg_z_idx] = 0.40  # Extra lift during swing
+            else:
+                act[2] = 0.20
+                act[8] = 0.35
+                act[11] = 0.35
+                act[14] = 0.35
+                act[17] = 0.35
+            return np.clip(act, -1.0, 1.0).astype(np.float32)
+        elif policy_type == "random":
+            return action_space.sample()
+        else:
+            return np.zeros(action_space.shape, dtype=np.float32)
     else:
-        return get_nominal_cycle_action()
+        # Gait cycle mode
+        if policy_type in ("nominal", "crawl", "walk"):
+            return get_nominal_cycle_action()
+        elif policy_type == "stand":
+            params = NOMINAL_ACTION_PARAMS.copy()
+            params[13:21] = 0.0
+            return normalize_action(params)
+        elif policy_type == "random":
+            return action_space.sample()
+        else:
+            return get_nominal_cycle_action()
 
 
 def run_compliance_check(env: gym.Env):
@@ -155,6 +200,7 @@ def run_environment_test():
         sys.exit(1)
 
     print_banner("QUADRUPED PATH-FOLLOWING TERRAIN TRAINING ENVIRONMENT TEST")
+    print(f"Action Mode:      {args.action_mode.upper()}")
     print(f"Policy:           {args.policy.upper()}")
     print(f"Render Mode:      {render_mode or 'DIRECT (Headless)'}")
     print(f"Episodes:         {args.episodes}")
@@ -196,6 +242,7 @@ def run_environment_test():
             task_config=task_cfg,
             terrain_config=terrain_cfg,
             action_scale=args.action_scale,
+            action_mode=args.action_mode,
             use_depth=not args.no_depth,
             depth_width=args.depth_width,
             depth_height=args.depth_height,
@@ -209,6 +256,7 @@ def run_environment_test():
             task_config=task_cfg,
             terrain_config=terrain_cfg,
             action_scale=args.action_scale,
+            action_mode=args.action_mode,
             use_depth=not args.no_depth,
             depth_width=args.depth_width,
             depth_height=args.depth_height,
@@ -262,7 +310,9 @@ def run_environment_test():
                 step_count += 1
 
                 # 3. Action Generation & Initiation
-                action = generate_test_action(args.policy, step, env.action_space)
+                action = generate_test_action(
+                    args.policy, step, env.action_space, action_mode=args.action_mode, obs=obs
+                )
 
                 # 4. Step Environment Transition
                 obs, reward, terminated, truncated, step_info = env.step(action)
@@ -290,12 +340,17 @@ def run_environment_test():
                     elif step_info.get("reached_end", False):
                         status_str = "REACHED-END"
 
+                    r_track = r_comp.get('reward_tracking', r_comp.get('reward_path', 0.0))
+                    r_vel = r_comp.get('reward_goal', r_comp.get('reward_velocity', 0.0))
+                    r_stab = r_comp.get('reward_orientation', r_comp.get('reward_stability', 0.0))
+                    r_prog = r_comp.get('reward_goal', r_comp.get('reward_progress', 0.0))
+
                     print(
                         f"{step_count:4d} | {reward:+9.3f} | "
-                        f"{r_comp.get('reward_path', 0.0):6.2f} "
-                        f"{r_comp.get('reward_velocity', 0.0):6.2f} "
-                        f"{r_comp.get('reward_stability', 0.0):6.2f} "
-                        f"{r_comp.get('reward_progress', 0.0):6.2f} | "
+                        f"{r_track:6.2f} "
+                        f"{r_vel:6.2f} "
+                        f"{r_stab:6.2f} "
+                        f"{r_prog:6.2f} | "
                         f"{roll_deg:+6.1f} {pitch_deg:+6.1f} {yaw_deg:+6.1f} | "
                         f"{offset_m:+7.3f} {dist_m:6.3f} | "
                         f"{vel_angle_deg:+8.1f} | {status_str}"
