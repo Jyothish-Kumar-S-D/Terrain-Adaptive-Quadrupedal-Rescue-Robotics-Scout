@@ -350,10 +350,8 @@ def main():
         policy_update_interval = 0.1
         latest_depth = None
         policy_action = None
-        max_steps = 500
-        step_count = 0
-        print("PyBullet GUI is running. Running for 500 steps...")
-        while p.isConnected(client) and step_count < max_steps:
+        print("PyBullet GUI is running. Close its window or press Ctrl+C to stop.")
+        while p.isConnected(client):
             # Advance the look-ahead waypoint once the robot reaches it.
             position = p.getBasePositionAndOrientation(robot_id)[0]
             next_waypoint = reached_or_passed(position, route, waypoint)
@@ -403,10 +401,9 @@ def main():
                 cloud.add(points, colors)
                 last_cloud_update = now
             time.sleep(DT)
-            step_count += 1
 
         video_recorder.close()
-        print(f"Simulation complete after {step_count} steps. Generating point cloud...")
+        print("Simulation ended. Generating final point cloud...")
 
         # Capture final depth frame for point cloud
         depth, segmentation = camera.capture_frame()
