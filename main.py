@@ -431,33 +431,51 @@ def main():
                 )
                 cloud.add(points, colors)
                 last_cloud_update = now
+
+            # Periodically save point cloud to disk (every 30 seconds)
+            if now - last_cloud_save >= cloud_save_interval:
+                cloud.save(cloud_path)
+                last_cloud_save = now
+
             time.sleep(DT)
 
-        video_recorder.close()
-        print("Simulation ended. Generating final point cloud...")
-
-        # Capture final depth frame for point cloud
-        depth, segmentation = camera.capture_frame()
-        points, colors = depth_to_point_cloud(
-            depth, camera, stride=4, segmentation=segmentation,
-        )
-        cloud.add(points, colors)
-
-        final_points = cloud.points()
-        final_colors = cloud.colors()
-        if len(final_points) > 2000:
-            display_indices = np.linspace(
-                0, len(final_points) - 1, 2000, dtype=int,
-            )
-            final_points = final_points[display_indices]
-            final_colors = final_colors[display_indices]
-        print(f"Scan complete: displaying {len(final_points)} points")
-        viewer = PointCloudViewer()
-        viewer.update(final_points, final_colors)
-        viewer.show()
     except KeyboardInterrupt:
-        pass
+        print("\nInterrupted. Saving video and point cloud...")
     finally:
+        # Always close video recorder
+        try:
+            video_recorder.close()
+        except Exception as e:
+            print(f"Warning: Could not close video recorder: {e}")
+
+        # Save final point cloud
+        try:
+            cloud.save(cloud_path)
+            print(f"Final point cloud saved: {cloud_path}")
+        except Exception as e:
+            print(f"Warning: Could not save point cloud: {e}")
+
+        # Generate and display point cloud from accumulated data
+        try:
+            print("Generating point cloud from accumulated frames...")
+            final_points = cloud.points()
+            final_colors = cloud.colors()
+            if len(final_points) > 0:
+                if len(final_points) > 5000:
+                    display_indices = np.linspace(
+                        0, len(final_points) - 1, 5000, dtype=int,
+                    )
+                    final_points = final_points[display_indices]
+                    final_colors = final_colors[display_indices]
+                print(f"Scan complete: displaying {len(final_points)} points")
+                viewer = PointCloudViewer()
+                viewer.update(final_points, final_colors)
+                viewer.show()
+            else:
+                print("No point cloud data accumulated.")
+        except Exception as e:
+            print(f"Warning: Could not generate point cloud: {e}")
+
         if p.isConnected(client):
             p.disconnect(client)
 
