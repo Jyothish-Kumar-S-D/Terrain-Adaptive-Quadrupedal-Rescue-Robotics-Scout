@@ -6,7 +6,8 @@ from typing import Iterator, List, Optional, Sequence, Tuple
 import pybullet as p
 
 
-def create_pyramid(position, size=1.5, height=0.5, color=[0.8, 0.3, 0.1, 1.0]):
+def create_pyramid(position, size=1.5, height=0.5, color=[0.8, 0.3, 0.1, 1.0],
+                   lateral_friction=1.5, spinning_friction=0.3, rolling_friction=0.3):
     half = size / 2.0
 
     vertices = [
@@ -46,6 +47,11 @@ def create_pyramid(position, size=1.5, height=0.5, color=[0.8, 0.3, 0.1, 1.0]):
         baseVisualShapeIndex=visual_shape,
         basePosition=position
     )
+
+    p.changeDynamics(pyramid_id, -1,
+                     lateralFriction=lateral_friction,
+                     spinningFriction=spinning_friction,
+                     rollingFriction=rolling_friction)
 
     return pyramid_id
 
@@ -115,11 +121,11 @@ class RandomTerrainConfig:
 
     seed: int = 7
     extent: float = 3.0
-    spacing: float = 0.26
-    size: Tuple[float, float] = (0.16, 0.34)
-    height: Tuple[float, float] = (0.02, 0.08)
+    spacing: float = 0.20
+    size: Tuple[float, float] = (0.08, 0.18)
+    height: Tuple[float, float] = (0.015, 0.06)
     density: float = 0.95
-    jitter: float = 0.05
+    jitter: float = 0.04
     clear_radius: float = 0.45
     base_z: float = 0.0
     palette: Optional[Sequence] = None
@@ -182,6 +188,71 @@ def create_random_terrain(config: Optional[RandomTerrainConfig] = None,
     cfg = _resolve(config, overrides)
     return [
         create_pyramid((x, y, cfg.base_z), size=size,
-                       height=height, color=color)
+                       height=height, color=color,
+                       lateral_friction=1.5, spinning_friction=0.3, rolling_friction=0.3)
         for x, y, size, height, color in terrain_layout(cfg)
     ]
+
+
+def create_random_terrain_along_path(path: EpisodePath,
+                                     config: Optional[RandomTerrainConfig] = None,
+                                     margin: float = 2.0,
+                                     **overrides) -> List[int]:
+    """Build random packed-pyramid terrain covering the full path.
+
+    The terrain is centered along the path's bounding box with a configurable
+    margin, ensuring obstacles cover the entire route and surrounding region.
+
+    Args:
+        path: EpisodePath with sampled points along the route.
+        config: Base RandomTerrainConfig (spacing, size, height, density, etc.).
+        margin: Extra padding [m] around the path's bounding box.
+        **overrides: Additional RandomTerrainConfig field overrides.
+
+    Returns:
+        List of pyramid body ids.
+    """
+    import numpy as np
+    cfg = _resolve(config, overrides)
+    points = path.points
+    min_x, min_y = np.min(points, axis=0)
+    max_x, max_y = np.max(points, axis=0)
+    center_x = (min_x + max_x) / 2.0
+    center_y = (min_y + max_y) / 2.0
+    extent_x = (max_x - min_x) + 2 * margin
+    extent_y = (max_y - min_y) + 2 * margin
+    extent = max(extent_x, extent_y)
+
+    # Override extent and center the terrain
+    overrides_with_center = {
+        "extent": extent,
+        **overrides,
+    }
+
+    rng = random.Random(cfg.seed)
+    palette = list(cfg.palette) if cfg.palette else list(DEFAULT_PALETTE)
+
+    pitch = max(cfg.spacing, 1e-3)
+    cells = max(1, int(extent / pitch))
+    start_x = center_x - extent / 2.0 + pitch / 2.0
+    start_y = center_y - extent / 2.0 + pitch / 2.0
+
+    terrain_ids = []
+    for i in range(cells):
+        for j in range(cells):
+            x = start_x + i * pitch + rng.uniform(-cfg.jitter, cfg.jitter)
+            y = start_y + j * pitch + rng.uniform(-cfg.jitter, cfg.jitter)
+            # Keep spawn area flat (near path start)
+            if math.hypot(x - points[0, 0], y - points[0, 1]) < cfg.clear_radius:
+                continue
+            if rng.random() > cfg.density:
+                continue
+            size = rng.uniform(*cfg.size)
+            height = rng.uniform(*cfg.height)
+            color = list(palette[rng.randrange(len(palette))])
+            terrain_ids.append(
+                create_pyramid((x, y, cfg.base_z), size=size,
+                               height=height, color=color,
+                               lateral_friction=1.5, spinning_friction=0.3, rolling_friction=0.3)
+            )
+    return terrain_ids

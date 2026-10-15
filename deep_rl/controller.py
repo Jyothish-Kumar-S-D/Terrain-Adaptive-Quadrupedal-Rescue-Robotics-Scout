@@ -79,8 +79,8 @@ class DepthPPOController:
         z_stand, z_down, cg_x = -0.22, -0.10, -0.085
 
         def add_training_arch(x, y, opening=0.9, height=0.75,
-                             depth=0.35, thickness=0.16):
-            """Add a low collidable gate centered on the episode route."""
+                             depth=0.35, thickness=0.16, yaw=0.0):
+            """Add a low collidable gate centered on the episode route, aligned with path."""
             pillar_half = [depth / 2, thickness / 2, height / 2]
             beam_half = [depth / 2, (opening + 2 * thickness) / 2,
                          thickness / 2]
@@ -104,16 +104,19 @@ class DepthPPOController:
                 ],
                 rgbaColors=[[0.82, 0.22, 0.12, 1.0]] * 3,
             )
+            orn = p.getQuaternionFromEuler([0, 0, yaw])
             return p.createMultiBody(
                 baseMass=0, baseCollisionShapeIndex=collision,
                 baseVisualShapeIndex=visual, basePosition=[x, y, 0],
+                baseOrientation=orn,
             )
 
         class PolicySpace(gym.Env):
             metadata = {"render_modes": []}
 
-            def __init__(self):
+            def __init__(self, seed=7):
                 super().__init__()
+                self._seed = seed
                 self.observation_space = spaces.Box(
                     low=-np.inf, high=np.inf, shape=(OBSERVATION_SIZE,),
                     dtype=np.float32,
@@ -142,6 +145,10 @@ class DepthPPOController:
                 self.steps = 0
                 self.max_steps = 1200
                 self._last_observation = None
+                self._path_debug_ids = []
+                self._fall_reward = -10.0
+                self._living_penalty = -0.005
+                self._off_path_reward = -0.3
 
             def reset(self, *, seed=None, options=None):
                 super().reset(seed=seed)
@@ -151,12 +158,25 @@ class DepthPPOController:
                 p.setTimeStep(dt)
                 p.loadURDF("plane.urdf")
                 route = self.task.reset_episode(seed=seed, load_terrain=True)
-                # Put gates at distinct points along the randomized path so
-                # each rollout learns route following with arch obstacles.
-                for fraction in (0.28, 0.56, 0.82):
-                    gate_index = int(fraction * (len(route.points) - 1))
+                self._draw_path(route)
+                # Put gates at randomized positions along the path with jitter.
+                # Number of gates varies (2-4) and positions are randomized.
+                n_gates = 3
+                rng = np.random.default_rng(self._seed + self.task.episode_index + 12345)
+                gate_fractions = rng.uniform(0.15, 0.85, n_gates)
+                gate_fractions.sort()
+                for frac in gate_fractions:
+                    gate_index = int(frac * (len(route.points) - 1))
                     gate_x, gate_y = route.points[gate_index]
-                    add_training_arch(float(gate_x), float(gate_y))
+                    # Add lateral jitter to gate position.
+                    tangent = route.tangents[gate_index]
+                    normal = np.array([-tangent[1], tangent[0]])
+                    lateral_jitter = rng.uniform(-0.5, 0.5)
+                    gate_x += normal[0] * lateral_jitter
+                    gate_y += normal[1] * lateral_jitter
+                    # Align arch with path tangent so robot passes through along path.
+                    gate_yaw = math.atan2(tangent[1], tangent[0])
+                    add_training_arch(float(gate_x), float(gate_y), yaw=gate_yaw)
                 self.robot = p.loadURDF(
                     str(Path(__file__).resolve().parents[1] / "urdf" / "a1_unitree.urdf"),
                     [0, 0, 0.12], useFixedBase=False,
@@ -220,19 +240,46 @@ class DepthPPOController:
                 self.steps += 1
                 task_observation, observation = self._observe()
                 position = p.getBasePositionAndOrientation(self.robot)[0]
-                too_far_from_route = (
-                    float(task_observation["path_distance"])
-                    > self.task.config.off_path_termination_distance
-                )
-                terminated = bool(
-                    position[2] < 0.12
-                    or not np.isfinite(position).all()
-                    or too_far_from_route
-                )
+                orientation = p.getBasePositionAndOrientation(self.robot)[1]
+                roll, pitch, yaw = p.getEulerFromQuaternion(orientation)
+                path_distance = float(task_observation["path_distance"])
+                too_far_from_route = path_distance > self.task.config.off_path_termination_distance
+                # Detect falls in any direction: low height, excessive tilt, or invalid position.
+                height_fall = position[2] < 0.12
+                tilt_fall = abs(roll) > 0.7 or abs(pitch) > 0.7  # ~40 degrees
+                invalid_pos = not np.isfinite(position).all()
+                has_fallen = height_fall or tilt_fall or invalid_pos
+                terminated = bool(has_fallen or too_far_from_route)
                 truncated = self.steps >= self.max_steps
                 reward_parts = self.task.reward(task_observation, terminated=terminated)
                 reward = reward_parts["total"] - 0.01 * abs(float(action[1]))
+                reward += self._living_penalty
+                if has_fallen:
+                    reward += self._fall_reward
+                    reward_parts["fall_penalty"] = self._fall_reward
+                if too_far_from_route and not has_fallen:
+                    reward += self._off_path_reward
+                    reward_parts["off_path_reward"] = self._off_path_reward
                 return observation, float(reward), terminated, truncated, reward_parts
+
+            def _draw_path(self, route):
+                """Visualize the training path in PyBullet GUI."""
+                for debug_id in self._path_debug_ids:
+                    try:
+                        p.removeUserDebugItem(debug_id)
+                    except Exception:
+                        pass
+                self._path_debug_ids.clear()
+                points = route.points
+                for start, end in zip(points[::8], points[8::8]):
+                    debug_id = p.addUserDebugLine(
+                        [float(start[0]), float(start[1]), 0.035],
+                        [float(end[0]), float(end[1]), 0.035],
+                        lineColorRGB=[0.1, 0.95, 0.25],
+                        lineWidth=5,
+                        lifeTime=0,
+                    )
+                    self._path_debug_ids.append(debug_id)
 
             def _observe(self):
                 task_observation = self.task.observe(self.robot, self.camera)
@@ -256,7 +303,7 @@ class DepthPPOController:
                 if p.isConnected(self.client):
                     p.disconnect(self.client)
 
-        return PolicySpace()
+        return PolicySpace(seed=seed)
 
     def load(self):
         _, _, ppo = self._dependencies()
@@ -275,18 +322,160 @@ class DepthPPOController:
         self.model = model
         return True
 
-    def train(self, total_timesteps=100_000):
+    def _make_custom_policy(self):
+        """Create a custom policy with CNN for depth + MLP for state."""
+        try:
+            from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+            import torch as th
+            import torch.nn as nn
+            from gymnasium import spaces
+        except ImportError:
+            return "MlpPolicy"
+
+        class DepthStateExtractor(BaseFeaturesExtractor):
+            def __init__(self, observation_space: spaces.Box, features_dim: int = 512):
+                super().__init__(observation_space, features_dim)
+                depth_size = DEPTH_WIDTH * DEPTH_HEIGHT
+                state_size = STATE_SIZE
+
+                self.cnn = nn.Sequential(
+                    nn.Conv2d(1, 32, kernel_size=8, stride=4, padding=2),
+                    nn.ReLU(),
+                    nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=1),
+                    nn.ReLU(),
+                    nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
+                    nn.ReLU(),
+                    nn.Flatten(),
+                )
+
+                with th.no_grad():
+                    sample = th.zeros(1, 1, DEPTH_HEIGHT, DEPTH_WIDTH)
+                    cnn_out = self.cnn(sample).shape[1]
+
+                self.state_net = nn.Sequential(
+                    nn.Linear(state_size, 128),
+                    nn.ReLU(),
+                    nn.Linear(128, 128),
+                    nn.ReLU(),
+                )
+
+                combined = cnn_out + 128
+                self.fusion = nn.Sequential(
+                    nn.Linear(combined, 512),
+                    nn.ReLU(),
+                    nn.Linear(512, features_dim),
+                    nn.ReLU(),
+                )
+
+            def forward(self, obs: th.Tensor) -> th.Tensor:
+                depth_size = DEPTH_WIDTH * DEPTH_HEIGHT
+                depth = obs[:, :depth_size].view(-1, 1, DEPTH_HEIGHT, DEPTH_WIDTH)
+                state = obs[:, depth_size:]
+                depth_feat = self.cnn(depth)
+                state_feat = self.state_net(state)
+                return self.fusion(th.cat([depth_feat, state_feat], dim=1))
+
+        from stable_baselines3.ppo import MlpPolicy
+        class CustomPolicy(MlpPolicy):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+
+        return lambda *args, **kwargs: CustomPolicy(
+            *args,
+            features_extractor_class=DepthStateExtractor,
+            features_extractor_kwargs=dict(features_dim=512),
+            net_arch=dict(pi=[512, 256, 128], vf=[512, 256, 128]),
+            activation_fn=nn.ReLU,
+            **kwargs,
+        )
+
+    def train(self, total_timesteps=100_000, initial_lr=3e-4, final_lr=3e-5,
+                n_steps=128, batch_size=64, gamma=0.99, ent_coef=0.01):
         """Train a PPO checkpoint; use a PyBullet rollout env for real learning."""
         _, _, ppo = self._dependencies()
         env = self.make_policy_env(self.seed)
-        model = ppo("MlpPolicy", env, verbose=1, seed=self.seed,
-                    learning_rate=3e-4, n_steps=256, batch_size=64,
-                    gamma=0.99, ent_coef=0.01)
+        lr_schedule = lambda progress: initial_lr + (final_lr - initial_lr) * progress
+        policy = self._make_custom_policy()
+        model = ppo(policy, env, verbose=1, seed=self.seed,
+                    learning_rate=lr_schedule, n_steps=n_steps, batch_size=batch_size,
+                    gamma=gamma, ent_coef=ent_coef)
+
+        best_reward = -float('inf')
+        best_model_path = self.model_path.with_suffix('.best.zip')
+
+        class BestModelCallback:
+            def __init__(self, model, best_model_path):
+                self.model = model
+                self.best_model_path = best_model_path
+                self.best_score = -float('inf')
+                self.episode_rewards = []
+                self.episode_lengths = []
+                self.losses = []
+
+            def __call__(self, locals_, globals_):
+                # Track episode metrics from infos
+                if 'infos' in locals_:
+                    for info in locals_['infos']:
+                        if 'episode' in info:
+                            ep_reward = info['episode']['r']
+                            ep_len = info['episode']['l']
+                            self.episode_rewards.append(ep_reward)
+                            self.episode_lengths.append(ep_len)
+
+                # Track losses from logger
+                if 'losses' in locals_:
+                    self.losses.append(locals_['losses'])
+
+                # Compute composite score every 10 episodes
+                if len(self.episode_rewards) % 10 == 0 and len(self.episode_rewards) > 0:
+                    score = self._compute_score()
+                    if score > self.best_score:
+                        self.best_score = score
+                        self.model.save(str(self.best_model_path))
+                        print(f"New best model saved: reward={np.mean(self.episode_rewards[-10:]):.2f}, "
+                              f"len={np.mean(self.episode_lengths[-10:]):.1f}, "
+                              f"score={score:.4f}")
+                return True
+
+            def _compute_score(self):
+                """Composite score: reward + normalized length - normalized loss."""
+                recent_rewards = np.array(self.episode_rewards[-10:])
+                recent_lengths = np.array(self.episode_lengths[-10:])
+
+                # Normalize reward (higher is better)
+                reward_score = np.mean(recent_rewards)
+
+                # Normalize length (higher is better, cap at max_steps)
+                max_steps = 1200
+                length_score = np.mean(recent_lengths) / max_steps
+
+                # Loss penalty (lower is better)
+                loss_score = 0.0
+                if self.losses:
+                    recent_losses = self.losses[-5:]
+                    avg_policy_loss = np.mean([l.get('policy_loss', 0) for l in recent_losses])
+                    avg_value_loss = np.mean([l.get('value_loss', 0) for l in recent_losses])
+                    loss_score = -(avg_policy_loss + avg_value_loss) * 100  # Scale down
+
+                # Weighted combination
+                return 1.0 * reward_score + 0.5 * length_score + 0.3 * loss_score
+
+        callback = BestModelCallback(model, best_model_path)
         try:
-            model.learn(total_timesteps=int(total_timesteps))
+            model.learn(total_timesteps=int(total_timesteps), callback=callback)
             self.model_path.parent.mkdir(parents=True, exist_ok=True)
             model.save(str(self.model_path))
             self.model = model
+            if callback.episode_rewards:
+                print(f"Training complete. Best composite score: {callback.best_score:.4f}")
+                print(f"  Avg reward (last 10): {np.mean(callback.episode_rewards[-10:]):.2f}")
+                print(f"  Avg episode length (last 10): {np.mean(callback.episode_lengths[-10:]):.1f}")
+                if callback.losses:
+                    recent = callback.losses[-5:]
+                    pl = np.mean([l.get('policy_loss', 0) for l in recent])
+                    vl = np.mean([l.get('value_loss', 0) for l in recent])
+                    print(f"  Avg policy/value loss: {pl:.4f}/{vl:.4f}")
+            print(f"Best model saved to: {best_model_path}")
         finally:
             env.close()
         return self.model_path
