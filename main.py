@@ -7,6 +7,7 @@ import math
 import time
 from pathlib import Path
 
+import cv2
 import numpy as np
 import pybullet as p
 import pybullet_data
@@ -25,6 +26,68 @@ from path_training import PathTaskConfig, PathTrainingTask
 from surrounding_building.terrain_building import RandomTerrainConfig
 
 
+class VideoRecorder:
+    """Records simulation frames and saves as video."""
+
+    def __init__(self, output_path, width=1280, height=720, fps=30):
+        self.output_path = Path(output_path)
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.writer = None
+        self.frame_count = 0
+
+    def start(self):
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        self.writer = cv2.VideoWriter(
+            str(self.output_path), fourcc, self.fps, (self.width, self.height)
+        )
+        if not self.writer.isOpened():
+            raise RuntimeError(f"Failed to open video writer for {self.output_path}")
+
+    def capture_frame(self, robot_id, orbit_radius=2.0, orbit_height=0.5, orbit_speed=0.2):
+        """Capture a frame from an orbiting camera around the robot."""
+        pos, _ = p.getBasePositionAndOrientation(robot_id)
+        robot_x, robot_y, robot_z = pos
+
+        # Orbit angle based on time
+        angle = time.time() * orbit_speed
+        cam_x = robot_x + orbit_radius * math.cos(angle)
+        cam_y = robot_y + orbit_radius * math.sin(angle)
+        cam_z = robot_z + orbit_height
+
+        # Look at robot
+        view_matrix = p.computeViewMatrix(
+            cameraEyePosition=[cam_x, cam_y, cam_z],
+            cameraTargetPosition=[robot_x, robot_y, robot_z],
+            cameraUpVector=[0, 0, 1],
+        )
+        proj_matrix = p.computeProjectionMatrixFOV(
+            fov=60, aspect=self.width / self.height, nearVal=0.1, farVal=100
+        )
+        _, _, rgb, _, _ = p.getCameraImage(
+            width=self.width, height=self.height,
+            viewMatrix=view_matrix, projectionMatrix=proj_matrix,
+            renderer=p.ER_BULLET_HARDWARE_OPENGL,
+        )
+        # Convert BGRA to BGR for OpenCV
+        frame = np.array(rgb, dtype=np.uint8).reshape(self.height, self.width, 4)
+        frame = frame[:, :, :3]  # Drop alpha
+        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        return frame
+
+    def write_frame(self, frame):
+        if self.writer is not None:
+            self.writer.write(frame)
+            self.frame_count += 1
+
+    def close(self):
+        if self.writer is not None:
+            self.writer.release()
+            self.writer = None
+            print(f"Video saved: {self.output_path} ({self.frame_count} frames)")
+
+
 DT = 1.0 / 120.0
 MAX_FORCE = 33.5
 Z_DOWN = -0.10
@@ -32,11 +95,16 @@ Z_STAND = -0.22
 CG_X = -0.085
 PROJECT_DIR = Path(__file__).resolve().parent
 DEPTH_FRAME_DIR = PROJECT_DIR / "depth_frames"
-PPO_MODEL_PATH = PROJECT_DIR / "models" / "a1_depth_ppo"
+PPO_MODEL_PATH = PROJECT_DIR / "models" / "a1_depth_ppo.best"
 
 def add_arch(position, opening=1.05, height=1.5, depth=0.65, thickness=0.28,
-             color=(0.82, 0.22, 0.12, 1)):
-    """Create a three-piece arch as one colored, collidable PyBullet body."""
+             color=(0.82, 0.22, 0.12, 1), yaw=0.0):
+    """Create a three-piece arch as one colored, collidable PyBullet body.
+
+    Args:
+        position: (x, y) base position
+        yaw: rotation around z-axis in radians (aligns arch opening with path)
+    """
     pillar_half = [depth / 2, thickness / 2, (height - thickness) / 2]
     beam_half = [depth / 2, (opening + 2 * thickness) / 2, thickness / 2]
     pillar_y = opening / 2 + thickness / 2
@@ -62,11 +130,13 @@ def add_arch(position, opening=1.05, height=1.5, depth=0.65, thickness=0.28,
         ],
         rgbaColors=[color, color, color],
     )
+    orn = p.getQuaternionFromEuler([0, 0, yaw])
     return p.createMultiBody(
         baseMass=0,
         baseCollisionShapeIndex=collision,
         baseVisualShapeIndex=visual,
         basePosition=[position[0], position[1], 0],
+        baseOrientation=orn,
     )
 
 
@@ -214,16 +284,24 @@ def main():
             path_samples=360,
             terrain=RandomTerrainConfig(
                 extent=9.0,
-                spacing=0.34,
-                size=(0.24, 0.52),
-                height=(0.04, 0.22),
+                spacing=0.20,
+                size=(0.08, 0.18),
+                height=(0.015, 0.06),
                 density=0.82,
-                jitter=0.10,
+                jitter=0.04,
                 clear_radius=0.75,
             ),
         ))
         route = task.reset_episode(load_terrain=True)
         draw_path(route)
+        # Add gates along the path for visual guidance, aligned with path tangent.
+        for fraction in (0.2, 0.4, 0.6, 0.8):
+            gate_index = int(fraction * (len(route.points) - 1))
+            gate_x, gate_y = route.points[gate_index]
+            # Get tangent at gate position to align arch with path direction.
+            tangent = route.tangents[gate_index]
+            gate_yaw = math.atan2(tangent[1], tangent[0])
+            add_arch((gate_x, gate_y), yaw=gate_yaw)
         robot_id = p.loadURDF(
             "urdf/a1_unitree.urdf",
             basePosition=[0, 0, 0.12],
@@ -259,6 +337,14 @@ def main():
         camera = DepthCamera(robot_id)
         frame_store = DepthFrameStore(DEPTH_FRAME_DIR)
         cloud = PointCloudAccumulator()
+
+        # Video recorder for orbiting camera
+        video_dir = PROJECT_DIR / "videos"
+        video_dir.mkdir(exist_ok=True)
+        video_path = video_dir / f"simulation_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
+        video_recorder = VideoRecorder(video_path, width=1280, height=720, fps=30)
+        video_recorder.start()
+
         last_cloud_update = 0.0
         last_policy_update = 0.0
         policy_update_interval = 0.1
@@ -299,6 +385,11 @@ def main():
                 gait.set_next_cycle(policy_command)
             command_legs(robot_id, joints, gait.update(DT))
             p.stepSimulation()
+
+            # Record video frame
+            frame = video_recorder.capture_frame(robot_id)
+            video_recorder.write_frame(frame)
+
             now = time.monotonic()
             if now - last_cloud_update >= 0.1:
                 depth, segmentation = camera.capture_frame()
@@ -310,6 +401,8 @@ def main():
                 cloud.add(points, colors)
                 last_cloud_update = now
             time.sleep(DT)
+
+        video_recorder.close()
         final_points = cloud.points()
         final_colors = cloud.colors()
         if len(final_points) > 2000:
