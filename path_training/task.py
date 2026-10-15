@@ -26,10 +26,13 @@ class PathTaskConfig:
     depth_width: int = 64
     depth_height: int = 48
     # Reward weights
-    path_weight: float = 1.0
-    velocity_weight: float = 0.5
-    stability_weight: float = 0.5
-    progress_weight: float = 0.25
+    path_weight: float = 2.0
+    path_deviation_weight: float = 1.0
+    velocity_weight: float = 0.35
+    stability_weight: float = 0.35
+    progress_weight: float = 1.0
+    waypoint_bonus: float = 2.0
+    off_path_termination_distance: float = 1.25
     terrain: RandomTerrainConfig = None
 
     def __post_init__(self):
@@ -92,6 +95,7 @@ class PathTrainingTask:
         self.path = None
         self.terrain_ids = []
         self._last_progress_index = None
+        self._route_complete = False
 
     def reset_episode(self, seed=None, load_terrain=True):
         """Create a new random path and terrain realization for an episode.
@@ -131,6 +135,7 @@ class PathTrainingTask:
         )
         self.terrain_ids = create_random_terrain(terrain_cfg) if load_terrain else []
         self._last_progress_index = 0
+        self._route_complete = False
         self.episode_index += 1
         return self.path
 
@@ -192,10 +197,13 @@ class PathTrainingTask:
         }
 
     def reward(self, observation, *, terminated=False):
-        """Compute path, tangent-speed, trunk stability, and progress rewards."""
+        """Reward adherence and forward progress on this episode's random path."""
         cfg = self.config
-        path_term = math.exp(-0.5 * (float(observation["path_distance"])
-                                     / max(cfg.path_tolerance, 1e-6)) ** 2)
+        distance = float(observation["path_distance"])
+        path_term = math.exp(-0.5 * (distance / max(cfg.path_tolerance, 1e-6)) ** 2)
+        # A continuous penalty makes leaving the route costly even when the
+        # Gaussian path bonus has already become close to zero.
+        deviation_penalty = min(distance / max(cfg.path_tolerance, 1e-6), 5.0)
         velocity = np.asarray(observation["base_linear_velocity"], dtype=float)[:2]
         speed = float(np.linalg.norm(velocity))
         angle = float(observation["velocity_tangent_angle"])
@@ -206,16 +214,32 @@ class PathTrainingTask:
         roll, pitch = np.asarray(observation["trunk_orientation"], dtype=float)[:2]
         stability_term = math.exp(-0.5 * ((roll / 0.35) ** 2 + (pitch / 0.35) ** 2))
         index = int(observation["path_index"])
-        progress = 0.0 if self._last_progress_index is None else max(
-            0, index - self._last_progress_index) / max(len(self.path.points) - 1, 1)
-        self._last_progress_index = index
-        reward = (cfg.path_weight * path_term + cfg.velocity_weight * velocity_term
+        previous_index = self._last_progress_index
+        progress = 0.0 if previous_index is None else max(
+            0, index - previous_index) / max(len(self.path.points) - 1, 1)
+        # Only grant progress reward while the robot remains near its assigned
+        # route, so cutting across bends is not an attractive shortcut.
+        progress *= path_term
+        self._last_progress_index = max(previous_index or 0, index)
+        reached_goal = (index >= len(self.path.points) - 2
+                        and distance <= cfg.path_tolerance)
+        goal_bonus = cfg.waypoint_bonus if reached_goal and not self._route_complete else 0.0
+        self._route_complete = self._route_complete or reached_goal
+        reward = (cfg.path_weight * path_term
+                  - cfg.path_deviation_weight * deviation_penalty
+                  + cfg.velocity_weight * velocity_term
                   + cfg.stability_weight * stability_term
-                  + cfg.progress_weight * progress)
+                  + cfg.progress_weight * progress
+                  + goal_bonus)
+        off_path = distance > cfg.off_path_termination_distance
+        if off_path:
+            reward -= cfg.path_deviation_weight
         if terminated:
             reward -= 1.0
         return {
             "total": float(reward), "path": path_term,
+            "path_deviation_penalty": deviation_penalty,
             "velocity_alignment": velocity_term, "stability": stability_term,
-            "progress": progress,
+            "progress": progress, "goal_bonus": goal_bonus,
+            "off_path": off_path,
         }

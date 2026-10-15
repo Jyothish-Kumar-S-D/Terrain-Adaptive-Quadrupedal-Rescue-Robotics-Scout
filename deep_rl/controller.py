@@ -179,7 +179,15 @@ class DepthPPOController:
                 self.steps += 1
                 task_observation, observation = self._observe()
                 position = p.getBasePositionAndOrientation(self.robot)[0]
-                terminated = bool(position[2] < 0.12 or not np.isfinite(position).all())
+                too_far_from_route = (
+                    float(task_observation["path_distance"])
+                    > self.task.config.off_path_termination_distance
+                )
+                terminated = bool(
+                    position[2] < 0.12
+                    or not np.isfinite(position).all()
+                    or too_far_from_route
+                )
                 truncated = self.steps >= self.max_steps
                 reward_parts = self.task.reward(task_observation, terminated=terminated)
                 reward = reward_parts["total"] - 0.01 * abs(float(action[1]))
