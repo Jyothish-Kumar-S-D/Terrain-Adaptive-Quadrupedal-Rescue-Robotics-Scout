@@ -5,6 +5,7 @@ Run from the project root with ``venv/bin/python main.py``.
 
 import math
 import time
+from pathlib import Path
 
 import numpy as np
 import pybullet as p
@@ -18,6 +19,8 @@ from Inverse_Kinematics.IK_A1 import (
     foot_to_joints,
 )
 from point_cloud import PointCloudAccumulator, PointCloudViewer, depth_to_point_cloud
+from deep_rl import DepthPPOController, depth_observation
+from deep_rl.depth_dataset import DepthFrameStore
 
 
 DT = 1.0 / 120.0
@@ -25,6 +28,9 @@ MAX_FORCE = 33.5
 Z_DOWN = -0.10
 Z_STAND = -0.22
 CG_X = -0.085
+PROJECT_DIR = Path(__file__).resolve().parent
+DEPTH_FRAME_DIR = PROJECT_DIR / "depth_frames"
+PPO_MODEL_PATH = PROJECT_DIR / "models" / "a1_depth_ppo"
 
 # Alternating waypoints steer the robot around the large blocks.
 PATH = (
@@ -149,6 +155,29 @@ def path_command(robot_id, path_index):
     )
 
 
+def _command_turn(command):
+    """Recover the signed differential turn from left/right leg strides."""
+    right_stride = command.legs["FR"].length_x
+    left_stride = command.legs["FL"].length_x
+    average = right_stride + left_stride
+    if abs(average) < 1e-9:
+        return 0.0
+    return max(-1.0, min(1.0, (right_stride - left_stride) / average))
+
+
+def policy_state(robot_id):
+    """Compact state paired with depth for the PPO policy."""
+    position, quaternion = p.getBasePositionAndOrientation(robot_id)
+    linear_velocity, angular_velocity = p.getBaseVelocity(robot_id)
+    roll, pitch, yaw = p.getEulerFromQuaternion(quaternion)
+    return np.asarray([
+        roll / math.pi, pitch / math.pi, math.sin(yaw), math.cos(yaw),
+        *np.clip(np.asarray(linear_velocity) / 2.0, -1.0, 1.0),
+        *np.clip(np.asarray(angular_velocity) / 4.0, -1.0, 1.0),
+        float(position[2]) / 0.5,
+    ], dtype=np.float32)
+
+
 def reached_or_passed(position, waypoint_index):
     """Avoid getting stuck when momentum carries the robot past a waypoint."""
     target = PATH[waypoint_index]
@@ -203,45 +232,71 @@ def main():
         stand_up(robot_id, joints)
 
         waypoint = 1
-        gait = CrawlGait(path_command(robot_id, waypoint))
-        gait.cycle_provider = lambda _cycle: path_command(robot_id, waypoint)
+        fallback_gait = lambda: path_command(robot_id, waypoint)
+        controller = DepthPPOController(PPO_MODEL_PATH)
+        policy_loaded = False
+        try:
+            policy_loaded = controller.load()
+        except RuntimeError as error:
+            print(f"DeepRL unavailable ({error}); using analytic crawl gait")
+        if policy_loaded:
+            print(f"Loaded depth PPO policy: {PPO_MODEL_PATH}")
+        else:
+            print("No trained PPO checkpoint found; using analytic crawl gait")
+        gait = CrawlGait(fallback_gait())
+        gait.cycle_provider = lambda _cycle: fallback_gait()
         camera = DepthCamera(robot_id)
+        frame_store = DepthFrameStore(DEPTH_FRAME_DIR)
         cloud = PointCloudAccumulator()
         last_cloud_update = 0.0
-        scan_started = time.monotonic()
-        final_reached_at = None
-        scan_timeout = 120.0
+        last_policy_update = 0.0
+        policy_update_interval = 0.1
+        latest_depth = None
+        policy_action = None
+        print("PyBullet GUI is running. Close its window or press Ctrl+C to stop.")
         while p.isConnected(client):
             # Advance the look-ahead waypoint once the robot reaches it.
             position = p.getBasePositionAndOrientation(robot_id)[0]
             while waypoint < len(PATH) - 1 and reached_or_passed(position, waypoint):
                 waypoint += 1
                 gait.set_next_cycle(path_command(robot_id, waypoint))
-            at_final_waypoint = (
-                waypoint == len(PATH) - 1
-                and math.dist(position[:2], PATH[-1]) < 0.65
-            )
-            if at_final_waypoint:
-                if final_reached_at is None:
-                    final_reached_at = time.monotonic()
-            else:
-                final_reached_at = None
-
+            if (
+                policy_loaded
+                and latest_depth is not None
+                and time.monotonic() - last_policy_update >= policy_update_interval
+            ):
+                state = policy_state(robot_id)
+                observation = depth_observation(latest_depth, state)
+                policy_action = controller.predict(observation)
+                last_policy_update = time.monotonic()
+                policy_command = controller.action_to_gait(
+                    policy_action, CycleCommand,
+                    stance_z=Z_STAND, cg_offset_x=CG_X,
+                )
+                # The route planner supplies heading correction; PPO selects
+                # stride, clearance, and cadence from depth and body state.
+                route_command = fallback_gait()
+                policy_command = CycleCommand.differential(
+                    length_x=min(0.16, max(0.02, policy_command.legs["FR"].length_x)),
+                    turn=_command_turn(route_command),
+                    height=policy_command.legs["FR"].height,
+                    cycle_time=policy_command.cycle_time,
+                    stance_z=Z_STAND,
+                    cg_offset_x=CG_X,
+                )
+                gait.set_next_cycle(policy_command)
             command_legs(robot_id, joints, gait.update(DT))
             p.stepSimulation()
             now = time.monotonic()
             if now - last_cloud_update >= 0.1:
                 depth, segmentation = camera.capture_frame()
+                latest_depth = depth
+                frame_store.save(depth, policy_state(robot_id))
                 points, colors = depth_to_point_cloud(
                     depth, camera, stride=6, segmentation=segmentation,
                 )
                 cloud.add(points, colors)
                 last_cloud_update = now
-            if (
-                (final_reached_at is not None and now - final_reached_at >= 2.0)
-                or now - scan_started >= scan_timeout
-            ):
-                break
             time.sleep(DT)
         final_points = cloud.points()
         final_colors = cloud.colors()
